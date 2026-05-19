@@ -84,8 +84,21 @@ FALLBACK_SYMBOLS = {
 }
 
 STABLE_SYMBOLS = {
-    "USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "BUSD", "PYUSD", "USDD", "FRAX",
+    # 稳定币 / 类美元资产，全部排除，不做行情监控
+    "USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "USDS", "BUSD", "PYUSD", "USDD", "FRAX",
+    "USDP", "GUSD", "LUSD", "SUSD", "EURC", "EURS", "USD1", "RLUSD",
 }
+
+EXCLUDED_TOP_SYMBOLS = {
+    # 包装资产 / 质押衍生资产 / 平台积分类资产，不适合做独立行情监控
+    "STETH", "WSTETH", "WBTC", "WEETH", "RETH", "CBETH", "EZETH", "METH",
+    "LEO", "CRO", "OKB", "KCS",
+}
+
+EXCLUDED_NAME_KEYWORDS = [
+    "stablecoin", "stable coin", "usd", "tether", "circle", "dai",
+    "wrapped bitcoin", "wrapped btc", "staked ether", "liquid staked", "binance usd",
+]
 
 # 某些 CoinGecko symbol 与 Binance 交易对可能需要特殊处理，可后续补充
 COINGECKO_SYMBOL_ALIAS = {
@@ -213,6 +226,7 @@ GENERAL_TAGS = [
     "#币圈监控", "#行情监控", "#加密货币", "#主流币", "#短线信号",
     "#行情异动", "#支撑压力", "#成交量", "#短线结构", "#市场监控",
     "#币圈行情", "#价格监控", "#趋势观察", "#资金情绪", "#多空变化",
+    "#主流币监控", "#短线行情", "#市场情绪", "#盘面观察", "#行情分析",
 ]
 
 EVENT_TAGS = {
@@ -249,6 +263,14 @@ NEWS_CATEGORY_TAGS = {
     "onchain": ["#链上监控", "#巨鲸监控", "#资金流向", "#钱包监控", "#交易所流入"],
     "airdrop": ["#空投", "#空投监控", "#撸毛情报", "#测试网交互", "#积分任务"],
 }
+
+# 正文关键词池：不用全变成标签，放在“关键词观察”里，增加搜索命中但不堆标签
+KEYWORD_TEXT_POOL = [
+    "币圈监控", "行情监控", "主流币监控", "短线行情", "行情异动",
+    "支撑压力", "成交量变化", "短线结构", "多空变化", "市场情绪",
+    "BTC监控", "ETH监控", "山寨币监控", "交易所监控", "链上监控",
+    "新闻驱动", "资金情绪", "趋势观察", "盘面观察", "风险监控",
+]
 
 
 # =========================
@@ -673,14 +695,20 @@ def fetch_top_market_symbols() -> Dict[str, str]:
         result = {}
         for item in data:
             raw_symbol = str(item.get("symbol", "")).lower().strip()
+            coin_name = str(item.get("name", "")).lower().strip()
+            coin_id = str(item.get("id", "")).lower().strip()
             if not raw_symbol:
                 continue
 
-            display = COINGECKO_SYMBOL_ALIAS.get(raw_symbol, raw_symbol.upper())
-            if display.upper() in STABLE_SYMBOLS:
+            display = COINGECKO_SYMBOL_ALIAS.get(raw_symbol, raw_symbol.upper()).upper()
+
+            # 去除稳定币、包装币、质押衍生币，避免频道内容被稳定币稀释
+            if display in STABLE_SYMBOLS or display in EXCLUDED_TOP_SYMBOLS:
+                continue
+            if any(k in coin_name or k in coin_id for k in EXCLUDED_NAME_KEYWORDS):
                 continue
 
-            pair = f"{display.upper()}USDT"
+            pair = f"{display}USDT"
             if pair in result:
                 continue
 
@@ -1001,6 +1029,11 @@ NEWS_SKIP_KEYWORDS = [
     "press release", "opinion", "podcast", "newsletter", "watch live", "live updates",
 ]
 
+STABLECOIN_NEWS_KEYWORDS = [
+    "stablecoin", "stablecoins", "usdt", "usdc", "tether", "circle", "dai",
+    "fdusd", "usde", "usds", "pyusd", "busd", "frxusd", "frax",
+]
+
 AIRDROP_KEYWORDS = [
     "airdrop", "airdrops", "claim", "eligible", "eligibility", "snapshot", "points",
     "quest", "quests", "testnet", "galxe", "layer3", "zealy", "faucet", "reward",
@@ -1052,7 +1085,14 @@ def classify_news(title: str, summary: str) -> Tuple[List[str], List[str]]:
 
 def should_skip_news(title: str, summary: str) -> bool:
     text = f"{title} {summary}".lower()
-    return any(k in text for k in NEWS_SKIP_KEYWORDS)
+    if any(k in text for k in NEWS_SKIP_KEYWORDS):
+        return True
+
+    # 用户要求去除稳定币：稳定币新闻不作为行情背景，避免搜索词和频道画像跑偏
+    if any(k in text for k in STABLECOIN_NEWS_KEYWORDS):
+        return True
+
+    return False
 
 
 def update_news_cache(force: bool = False):
@@ -1189,6 +1229,40 @@ def build_title_prefix(event: dict) -> str:
     return random.choice(TITLE_PREFIX_POOL.get(event["event_type"], ["币圈监控", "行情监控", "主流币监控"]))
 
 
+def build_keyword_text(analysis: dict, event: dict, news_context: List[dict]) -> str:
+    """正文里的关键词观察：不超过 6 个，提升搜索命中，但排版保持干净。"""
+    display = analysis.get("display", "")
+    event_type = event.get("event_type", "")
+
+    pool = KEYWORD_TEXT_POOL[:]
+    if display:
+        pool.extend([f"{display}监控", f"{display}行情"])
+
+    if event_type == "breakout":
+        pool.extend(["突破监控", "压力位", "短线转强"])
+    elif event_type == "breakdown":
+        pool.extend(["跌破监控", "支撑位", "短线转弱"])
+    elif event_type == "volume_spike":
+        pool.extend(["放量异动", "成交量放大", "资金异动"])
+    elif event_type == "signal_change":
+        pool.extend(["信号监控", "趋势切换", "短线信号"])
+
+    for n in news_context:
+        for category in n.get("categories", []):
+            if category == "macro":
+                pool.extend(["宏观快讯", "ETF", "监管"])
+            elif category == "exchange":
+                pool.extend(["交易所监控", "新币上线", "Binance"])
+            elif category == "onchain":
+                pool.extend(["链上监控", "巨鲸监控", "资金流向"])
+            elif category == "airdrop":
+                pool.extend(["空投监控", "撸毛情报", "积分任务"])
+
+    pool = unique_keep_order(pool)
+    random.shuffle(pool)
+    return "、".join(pool[:random.randint(4, 6)])
+
+
 def build_invalid_line(analysis: dict) -> str:
     signal = analysis["signal"]
     support = fmt_price(analysis["symbol"], analysis["support"])
@@ -1229,42 +1303,45 @@ def ai_generate_market_content(analysis: dict, event: dict, news_context: List[d
     resistance = fmt_price(symbol, analysis["resistance"])
     event_cn = EVENT_CN.get(event["event_type"], "行情观察")
     news_bg = format_news_background(news_context)
+    keyword_text = build_keyword_text(analysis, event, news_context)
 
     prompt = f"""
-请为 Telegram 币圈频道生成一条完整内容。
+请为 Telegram 币圈频道生成一条内容，排版必须清爽，不要写得像长文章。
+
+固定格式必须如下：
+【{prefix}｜{display}】
+
+行情：1-2句，说明当前短线结构和事件。
+新闻：1句，结合新闻背景，没有强相关新闻就写主要看价格结构和成交量。
+数据：现价 {price}｜1h {analysis['change_1h']:.2f}%｜24h {analysis['pct_24h']:.2f}%｜支撑 {support}｜压力 {resistance}｜信号 {analysis['signal']}
+观察：1句，说明支撑压力、成交量或失效/转强条件。
+关键词：{keyword_text}
+
+{tags}
 
 硬性要求：
-1. 标题必须是：【{prefix}｜{display}】
-2. 内容要结合“行情数据 + 新闻背景 + 监控重点”
-3. 不要发新闻链接，不要说来源链接
-4. 不要承诺涨跌，不要投资建议，不要喊单
-5. 尽量自然出现这些关键词中的3-5个：币圈监控、行情监控、主流币监控、短线结构、支撑压力、成交量、新闻驱动、行情异动
+1. 不要使用 Markdown 加粗，不要项目符号，不要编号
+2. 总字数控制在 260-420 个中文字符
+3. 不要投资建议，不要喊单，不要承诺涨跌
+4. 不要出现稳定币相关内容，例如 USDT、USDC、稳定币
+5. 正文自然出现 4-6 个搜索关键词，例如币圈监控、行情监控、主流币监控、短线结构、支撑压力、成交量、新闻驱动、行情异动
 6. 最后一行必须原样使用这些标签：{tags}
-7. 控制在 700 个中文字以内
-8. 语言要像真人盯盘，不要像公告
 
-数据：
+数据参考：
 币种：{display}
 事件：{event_cn}
 事件说明：{event.get('event_note')}
-现价：{price}
-1小时涨跌：{analysis['change_1h']:.2f}%
-24小时涨跌：{analysis['pct_24h']:.2f}%
-信号：{analysis['signal']}
-支撑：{support}
-压力：{resistance}
-量能倍数：{analysis['volume_ratio']:.2f}
 判断原因：{analysis['reason']}
 新闻背景：{news_bg}
 观察点：{build_invalid_line(analysis)}
-
-请直接输出频道文案，不要解释。
 """.strip()
 
     try:
         response = client.responses.create(model=MODEL_NAME, input=prompt)
         text = (response.output_text or "").strip()
         text = text.replace("...", "").replace("……", "")
+        # 清理可能出现的多余空行，让排版更稳
+        text = re.sub(r"\n{3,}", "\n\n", text)
         if 50 <= len(text) <= 1200:
             return text
     except Exception as e:
@@ -1283,58 +1360,18 @@ def fallback_market_content(analysis: dict, event: dict, news_context: List[dict
     event_cn = EVENT_CN.get(event["event_type"], "行情观察")
     news_bg = format_news_background(news_context)
     base = SIGNAL_TEXT.get(analysis["signal"], "短线结构仍需观察。")
+    keyword_text = build_keyword_text(analysis, event, news_context)
 
-    templates = [
-        f"""【{prefix}｜{display}】
+    # 统一成清爽排版：不再多段乱跳，但标题、关键词、标签会变化，避免一成不变
+    return f"""【{prefix}｜{display}】
 
-行情状态：
-{display} 当前进入币圈监控视野，短线信号为 {analysis['signal']}。{base}
+行情：{display} 当前触发{event_cn}，短线信号为 {analysis['signal']}。{base}
+新闻：{news_bg}
+数据：现价 {price}｜1h {analysis['change_1h']:.2f}%｜24h {analysis['pct_24h']:.2f}%｜支撑 {support}｜压力 {resistance}
+观察：{build_invalid_line(analysis)}，重点看成交量变化和支撑压力是否继续有效。
+关键词：{keyword_text}
 
-新闻背景：
-{news_bg}
-
-监控重点：
-现价：{price}
-1小时：{analysis['change_1h']:.2f}%
-24小时：{analysis['pct_24h']:.2f}%
-支撑压力：{support} / {resistance}
-量能倍数：{analysis['volume_ratio']:.2f}
-{build_invalid_line(analysis)}
-
-{tags}""",
-        f"""【{prefix}｜{display}】
-
-{display} 出现{event_cn}，当前行情监控重点放在短线结构、成交量变化和支撑压力区间。
-
-新闻背景：
-{news_bg}
-
-数据观察：
-现价 {price}，1小时 {analysis['change_1h']:.2f}%，24小时 {analysis['pct_24h']:.2f}%。
-支撑 {support}，压力 {resistance}，当前信号：{analysis['signal']}。
-
-监控结论：
-{base} {build_invalid_line(analysis)}
-
-{tags}""",
-        f"""【{prefix}｜{display}】
-
-主流币监控更新：{display} 当前信号为 {analysis['signal']}，触发场景是{event_cn}。币圈行情监控不只看涨跌，还要看新闻驱动、量能和关键区间。
-
-新闻背景：
-{news_bg}
-
-关键数据：
-现价：{price}
-支撑：{support}
-压力：{resistance}
-1小时涨跌：{analysis['change_1h']:.2f}%
-24小时涨跌：{analysis['pct_24h']:.2f}%
-观察点：{build_invalid_line(analysis)}
-
-{tags}""",
-    ]
-    return random.choice(templates).strip()
+{tags}""".strip()
 
 
 def build_market_message(analysis: dict, event: dict, news_context: List[dict]) -> str:
