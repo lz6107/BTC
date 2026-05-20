@@ -64,6 +64,11 @@ HOTWORD_SEND_TIMES = os.getenv(
     "HOTWORD_SEND_TIMES",
     "09:00,10:30,12:00,13:30,15:00,16:30,18:00,19:30,21:00,22:30"
 )
+# 热词栏目必须由 RSS 证据驱动：不再用行情榜/内置词硬编。
+HOTWORD_EXCLUDE_MONITORED_COINS = os.getenv("HOTWORD_EXCLUDE_MONITORED_COINS", "true").lower() == "true"
+HOTWORD_EXTRA_EXCLUDE = os.getenv("HOTWORD_EXTRA_EXCLUDE", "BTC,ETH,BNB,XRP,SOL,TRX,DOGE,ADA,LINK,AVAX")
+HOTWORD_MIN_RSS_EVIDENCE = int(os.getenv("HOTWORD_MIN_RSS_EVIDENCE", "1"))
+HOTWORD_MAX_EVIDENCE_PER_TERM = int(os.getenv("HOTWORD_MAX_EVIDENCE_PER_TERM", "5"))
 
 # 动态市值前十
 ENABLE_DYNAMIC_TOP_COINS = os.getenv("ENABLE_DYNAMIC_TOP_COINS", "true").lower() == "true"
@@ -158,6 +163,7 @@ DEFAULT_IMAGE_MAP = {
     "DOTUSDT": "dot.png",
     "LTCUSDT": "ltc.png",
     "BCHUSDT": "bch.png",
+    "ZECUSDT": "zec.png",
     "UNIUSDT": "uni.png",
     "NEARUSDT": "near.png",
     "APTUSDT": "apt.png",
@@ -187,6 +193,8 @@ FIVE_MIN_MOVE_THRESHOLD = {
     "LINKUSDT": 0.90,
     "AVAXUSDT": 1.00,
     "SUIUSDT": 1.10,
+    "BCHUSDT": 0.80,
+    "ZECUSDT": 1.00,
     "PEPEUSDT": 1.50,
 }
 
@@ -202,6 +210,8 @@ PRICE_DECIMALS = {
     "LINKUSDT": 3,
     "AVAXUSDT": 3,
     "SUIUSDT": 4,
+    "BCHUSDT": 2,
+    "ZECUSDT": 2,
     "PEPEUSDT": 8,
 }
 
@@ -1401,8 +1411,9 @@ def ai_generate_market_content(analysis: dict, event: dict, news_context: List[d
 2. 总字数控制在 260-420 个中文字符
 3. 不要投资建议，不要喊单，不要承诺涨跌
 4. 不要出现稳定币相关内容，例如 USDT、USDC、稳定币
-5. 正文自然出现 4-6 个搜索关键词，例如币圈监控、行情监控、主流币监控、短线结构、支撑压力、成交量、新闻驱动、行情异动
-6. 最后一行必须原样使用这些标签：{tags}
+5. 所有判断必须来自“行情数据”或“新闻背景”，没有新闻背景就明确写“主要看价格结构和成交量”，不要编造消息面
+6. 正文自然出现 4-6 个搜索关键词，例如币圈监控、行情监控、主流币监控、短线结构、支撑压力、成交量、新闻驱动、行情异动
+7. 最后一行必须原样使用这些标签：{tags}
 
 数据参考：
 币种：{display}
@@ -1462,8 +1473,93 @@ def build_market_message(analysis: dict, event: dict, news_context: List[dict]) 
 
 
 # =========================
-# 币圈热词监控：每天 10 条，分散发送，只做热搜词 / 热搜币，不含空投撸毛
+# 币圈热词监控：RSS 证据驱动版
+# 每天 10 条，分散发送，只做 RSS 中真实出现的热搜词 / 热搜币
+# 不含空投撸毛，不用行情榜硬编，排除主流监控币作为热词标题
 # =========================
+
+BAD_HOTWORD_PHRASES = [
+    "市场注意力正在向这个关键词集中",
+    "当前监控热搜币",
+    "这类热词通常会影响搜索曝光",
+    "近期在币圈监控、行情监控",
+    "反复出现，说明市场注意力",
+    "主流币、山寨币、交易所公告或链上资金流向的搜索曝光",
+]
+
+
+def split_env_list(value: str) -> List[str]:
+    parts = []
+    for x in re.split(r"[,，\n\s]+", value or ""):
+        x = x.strip()
+        if x:
+            parts.append(x)
+    return parts
+
+
+def hotword_primary_exclude_terms() -> set:
+    """热词栏目主标题排除词：避免和行情监控栏目重复。"""
+    base = set()
+
+    # 用户可在 Railway 里扩展排除词
+    for x in split_env_list(HOTWORD_EXTRA_EXCLUDE):
+        base.add(x.upper())
+        base.add(x.lower())
+
+    # 默认排除稳定币、包装币、质押衍生资产
+    for x in STABLE_SYMBOLS | EXCLUDED_TOP_SYMBOLS:
+        base.add(x.upper())
+        base.add(x.lower())
+
+    # 默认排除主流监控币及常见中英文别名
+    mainstream_aliases = {
+        "BTC", "BITCOIN", "比特币", "比特币行情", "BTC监控",
+        "ETH", "ETHEREUM", "ETHER", "以太坊", "以太坊行情", "ETH监控",
+        "BNB", "BNB CHAIN", "币安币", "币安链",
+        "XRP", "RIPPLE",
+        "SOL", "SOLANA", "SOL监控",
+        "TRX", "TRON", "波场",
+        "DOGE", "DOGECOIN", "狗狗币",
+        "ADA", "CARDANO", "艾达币",
+        "LINK", "CHAINLINK",
+        "AVAX", "AVALANCHE",
+    }
+    for x in mainstream_aliases:
+        base.add(x.upper())
+        base.add(x.lower())
+        base.add(x)
+
+    if HOTWORD_EXCLUDE_MONITORED_COINS:
+        for symbol, display in SYMBOLS.items():
+            base.add(display.upper())
+            base.add(display.lower())
+            base.add(display)
+            base.add(symbol.replace("USDT", "").upper())
+
+    return base
+
+
+def is_hotword_primary_blocked(term: str) -> bool:
+    if not term:
+        return True
+    raw = term.strip()
+    upper = raw.upper()
+    lower = raw.lower()
+
+    if hotword_contains_blocked(raw):
+        return True
+
+    excludes = hotword_primary_exclude_terms()
+    if raw in excludes or upper in excludes or lower in excludes:
+        return True
+
+    # 形如 BTC监控 / ETH行情 也排除
+    normalized = re.sub(r"(行情|监控|价格|走势|热搜|币圈|主流币)", "", raw, flags=re.I).strip()
+    if normalized and (normalized in excludes or normalized.upper() in excludes or normalized.lower() in excludes):
+        return True
+
+    return False
+
 
 def hotword_contains_blocked(text: str) -> bool:
     lower = (text or "").lower()
@@ -1474,76 +1570,143 @@ def hotword_contains_blocked(text: str) -> bool:
     return False
 
 
-def hotword_tags_for_term(term: str) -> str:
-    term_upper = (term or "").upper()
+def hotword_low_quality(text: str) -> bool:
+    if not text:
+        return True
+    return any(p in text for p in BAD_HOTWORD_PHRASES)
+
+
+def hotword_term_in_text(pattern: str, text_lower: str) -> bool:
+    p = pattern.lower().strip()
+    if not p:
+        return False
+    # 英文/数字词用边界，避免 sol 命中 solution
+    if re.fullmatch(r"[a-z0-9][a-z0-9+.-]*", p):
+        return re.search(rf"(?<![a-z0-9]){re.escape(p)}(?![a-z0-9])", text_lower) is not None
+    return p in text_lower
+
+
+HOTWORD_RSS_KEYWORD_RULES = [
+    # 板块与叙事
+    ("meme", "MEME", "板块热词"), ("memecoin", "MEME", "板块热词"), ("memecoins", "MEME", "板块热词"),
+    ("ai token", "AI币", "板块热词"), ("ai tokens", "AI币", "板块热词"), ("artificial intelligence", "AI币", "板块热词"),
+    ("rwa", "RWA", "板块热词"), ("real world asset", "RWA", "板块热词"), ("tokenization", "代币化资产", "板块热词"),
+    ("depin", "DePIN", "板块热词"), ("gamefi", "GameFi", "板块热词"), ("gaming", "GameFi", "板块热词"),
+    ("layer 2", "Layer2", "板块热词"), ("l2", "Layer2", "板块热词"),
+    ("restaking", "Restaking", "板块热词"), ("staking", "质押", "链上热词"),
+    ("ordinals", "Ordinals", "板块热词"), ("runes", "Runes", "板块热词"),
+    ("nft", "NFT", "板块热词"), ("defi", "DeFi", "板块热词"), ("dex", "DEX", "板块热词"),
+    ("perp", "Perp", "合约热词"), ("perpetual", "Perp", "合约热词"),
+
+    # 交易所与公告
+    ("binance", "Binance", "交易所热词"), ("okx", "OKX", "交易所热词"), ("coinbase", "Coinbase", "交易所热词"),
+    ("kraken", "Kraken", "交易所热词"), ("bybit", "Bybit", "交易所热词"),
+    ("listing", "新币上线", "交易所热词"), ("listed", "新币上线", "交易所热词"),
+    ("launchpool", "Launchpool", "交易所热词"), ("launchpad", "Launchpad", "交易所热词"),
+    ("exchange", "交易所公告", "交易所热词"),
+
+    # 宏观监管
+    ("sec", "SEC", "监管热词"), ("regulation", "监管", "监管热词"), ("regulatory", "监管", "监管热词"),
+    ("etf", "ETF", "宏观热词"), ("filing", "ETF文件", "宏观热词"),
+    ("fed", "美联储", "宏观热词"), ("federal reserve", "美联储", "宏观热词"), ("rate cut", "降息", "宏观热词"),
+    ("inflation", "通胀", "宏观热词"), ("cpi", "CPI", "宏观热词"),
+
+    # 链上与风险
+    ("whale", "巨鲸", "链上热词"), ("wallet", "钱包监控", "链上热词"),
+    ("on-chain", "链上监控", "链上热词"), ("onchain", "链上监控", "链上热词"),
+    ("inflow", "资金流向", "链上热词"), ("outflow", "资金流向", "链上热词"),
+    ("liquidation", "爆仓", "合约热词"), ("liquidations", "爆仓", "合约热词"),
+    ("futures", "合约", "合约热词"), ("open interest", "持仓量", "合约热词"), ("funding rate", "资金费率", "合约热词"),
+    ("hack", "黑客攻击", "风险热词"), ("exploit", "漏洞攻击", "风险热词"),
+
+    # RSS 中出现的非主流热搜币，可作为热币栏目
+    ("ton", "TON", "热搜币"), ("near", "NEAR", "热搜币"), ("apt", "APT", "热搜币"), ("aptos", "APT", "热搜币"),
+    ("sui", "SUI", "热搜币"), ("wld", "WLD", "热搜币"), ("worldcoin", "WLD", "热搜币"),
+    ("fet", "FET", "热搜币"), ("fetch.ai", "FET", "热搜币"), ("inj", "INJ", "热搜币"), ("injective", "INJ", "热搜币"),
+    ("tia", "TIA", "热搜币"), ("celestia", "TIA", "热搜币"), ("jup", "JUP", "热搜币"), ("jupiter", "JUP", "热搜币"),
+    ("pyth", "PYTH", "热搜币"), ("pendle", "PENDLE", "热搜币"), ("arb", "ARB", "热搜币"), ("arbitrum", "ARB", "热搜币"),
+    ("op", "OP", "热搜币"), ("optimism", "OP", "热搜币"), ("sei", "SEI", "热搜币"),
+    ("render", "RENDER", "热搜币"), ("rndr", "RENDER", "热搜币"), ("tao", "TAO", "热搜币"), ("bittensor", "TAO", "热搜币"),
+    ("kas", "KAS", "热搜币"), ("kaspa", "KAS", "热搜币"), ("fil", "FIL", "热搜币"), ("filecoin", "FIL", "热搜币"),
+    ("ltc", "LTC", "热搜币"), ("litecoin", "LTC", "热搜币"), ("bch", "BCH", "热搜币"), ("bitcoin cash", "BCH", "热搜币"),
+    ("zec", "ZEC", "热搜币"), ("zcash", "ZEC", "热搜币"), ("dot", "DOT", "热搜币"), ("polkadot", "DOT", "热搜币"),
+    ("uni", "UNI", "热搜币"), ("uniswap", "UNI", "热搜币"), ("aave", "AAVE", "热搜币"),
+    ("ondo", "ONDO", "热搜币"), ("ena", "ENA", "热搜币"), ("hype", "HYPE", "热搜币"),
+]
+
+
+def hotword_tags_for_term(term: str, category: str = "") -> str:
     candidates = []
+    t = (term or "").upper()
 
-    if term_upper in {"BTC", "BITCOIN", "比特币"}:
-        candidates.extend(["#BTC", "#比特币行情", "#币圈热词", "#行情监控", "#主流币"])
-    elif term_upper in {"ETH", "ETHEREUM", "以太坊"}:
-        candidates.extend(["#ETH", "#以太坊行情", "#币圈热词", "#行情监控", "#主流币"])
-    elif term_upper in {"SOL", "BNB", "XRP", "DOGE", "ADA", "LINK", "AVAX", "TRX", "SUI", "PEPE"}:
-        candidates.extend([f"#{term_upper}", "#热搜币", "#山寨币", "#行情监控", "#币圈监控"])
-    elif "ETF" in term_upper:
-        candidates.extend(["#ETF", "#BTC", "#币圈热词", "#宏观", "#行情监控"])
-    elif "SEC" in term_upper or "监管" in term:
-        candidates.extend(["#SEC", "#监管", "#币圈热词", "#宏观", "#加密货币"])
-    elif "BINANCE" in term_upper or "OKX" in term_upper or "交易所" in term:
-        candidates.extend(["#交易所监控", "#Binance", "#OKX", "#币圈热词", "#加密货币"])
-    elif "爆仓" in term or "合约" in term:
-        candidates.extend(["#爆仓监控", "#合约", "#行情异动", "#币圈热词", "#市场情绪"])
-    elif "链上" in term or "巨鲸" in term or "资金流向" in term:
-        candidates.extend(["#链上监控", "#巨鲸监控", "#资金流向", "#币圈热词", "#行情监控"])
+    if category == "交易所热词" or any(x in t for x in ["BINANCE", "OKX", "COINBASE", "KRAKEN", "BYBIT"]):
+        candidates.extend(["#交易所监控", "#新币上线", "#币圈热词", "#行情监控"])
+    elif category == "合约热词" or term in {"爆仓", "合约", "持仓量", "资金费率", "Perp"}:
+        candidates.extend(["#爆仓监控", "#合约", "#多空变化", "#币圈热词"])
+    elif category == "链上热词":
+        candidates.extend(["#链上监控", "#巨鲸监控", "#资金流向", "#币圈热词"])
+    elif category in {"监管热词", "宏观热词"}:
+        candidates.extend(["#SEC", "#ETF", "#监管", "#币圈热词", "#宏观"])
+    elif category == "热搜币":
+        candidates.extend([f"#{term}", "#热搜币", "#山寨币", "#币圈热词", "#行情监控"])
     else:
-        candidates.extend(["#币圈热词", "#热词监控", "#行情监控", "#币圈监控", "#加密货币"])
+        candidates.extend([f"#{term}" if re.fullmatch(r"[A-Za-z0-9]+", term or "") else "#币圈热词", "#热词监控", "#行情监控", "#山寨币"])
 
-    # 从大池子补充，保证不同内容关键词变化
-    pool = HOTWORD_TAG_POOL[:]
+    pool = [x for x in HOTWORD_TAG_POOL if not is_hotword_primary_blocked(x.replace("#", ""))]
     random.shuffle(pool)
     candidates.extend(pool)
 
     candidates = [x for x in unique_keep_order(candidates) if not hotword_contains_blocked(x)]
+    candidates = [x for x in candidates if not is_hotword_primary_blocked(x.replace("#", ""))]
     target_count = random.randint(3, 5)
     return " ".join(candidates[:target_count])
 
 
-def add_hotword_score(scores: dict, term: str, points: float, reason: str):
+def summarize_evidence(evidence: List[dict], max_items: int = 3) -> str:
+    if not evidence:
+        return "RSS 新闻标题和摘要出现相关内容。"
+    sources = unique_keep_order([e.get("source", "RSS") for e in evidence if e.get("source")])[:max_items]
+    if not sources:
+        sources = ["RSS"]
+    return "、".join(sources) + " 的 RSS 标题/摘要出现相关内容"
+
+
+def add_hotword_score(scores: dict, term: str, points: float, category: str, evidence: dict):
     term = clean_html(term).strip()
-    if not term or hotword_contains_blocked(term):
+    if not term or is_hotword_primary_blocked(term):
         return
     if len(term) > 24:
         return
 
-    item = scores.setdefault(term, {"term": term, "score": 0.0, "reasons": []})
+    item = scores.setdefault(term, {
+        "term": term,
+        "category": category or "热词",
+        "score": 0.0,
+        "evidence": [],
+        "related_terms": set(),
+        "sources": set(),
+    })
     item["score"] += points
-    if reason and reason not in item["reasons"]:
-        item["reasons"].append(reason)
+    if category and not item.get("category"):
+        item["category"] = category
+
+    if evidence:
+        ev_key = (evidence.get("source"), evidence.get("title"))
+        exists = any((e.get("source"), e.get("title")) == ev_key for e in item["evidence"])
+        if not exists and len(item["evidence"]) < HOTWORD_MAX_EVIDENCE_PER_TERM:
+            item["evidence"].append(evidence)
+        if evidence.get("source"):
+            item["sources"].add(evidence.get("source"))
 
 
 def collect_hotword_candidates() -> List[dict]:
-    scores = {}
+    """只从已入库 RSS 新闻中提取热词，不用行情榜和内置词硬凑。"""
+    # 确保热词队列生成前先刷新一次 RSS
+    try:
+        update_news_cache(force=True)
+    except Exception as e:
+        print("热词生成前刷新 RSS 失败:", e)
 
-    # 1. 当前监控币种：天然热搜币
-    for symbol, display in SYMBOLS.items():
-        try:
-            ticker = fetch_24h_ticker(symbol)
-            change = ticker.get("price_change_percent", 0)
-            quote_volume = ticker.get("quote_volume", 0)
-            volume_score = min(math.log10(max(quote_volume, 1)) / 2, 6)
-            move_score = min(abs(change) / 2, 5)
-            add_hotword_score(scores, display, 8 + volume_score + move_score, f"{display} 是当前监控热搜币，24h {change:.2f}%")
-            if display == "BTC":
-                add_hotword_score(scores, "比特币行情", 8, "BTC 仍是主流币和币圈行情核心锚点")
-                add_hotword_score(scores, "BTC监控", 7, "BTC监控搜索词与行情监控高度相关")
-            elif display == "ETH":
-                add_hotword_score(scores, "以太坊行情", 7, "ETH 是主流币热搜方向")
-                add_hotword_score(scores, "ETH监控", 6, "ETH监控适合承接主流币行情搜索")
-            elif display in {"SOL", "BNB", "XRP", "DOGE", "ADA", "LINK", "AVAX", "TRX", "SUI", "PEPE"}:
-                add_hotword_score(scores, f"{display}监控", 5, f"{display} 属于热搜币和山寨币监控方向")
-        except Exception as e:
-            print(f"热词行情采集失败 {symbol}: {e}")
-
-    # 2. RSS 新闻标题与摘要：只提取行情、交易所、宏观、链上、热搜币，不要空投撸毛
     cutoff = time.time() - NEWS_LOOKBACK_HOURS * 3600
     conn = sqlite3.connect("data.db")
     cur = conn.cursor()
@@ -1552,31 +1715,20 @@ def collect_hotword_candidates() -> List[dict]:
         FROM news_items
         WHERE published_at >= ?
         ORDER BY published_at DESC
-        LIMIT 120
+        LIMIT 220
     """, (cutoff,))
     rows = cur.fetchall()
     conn.close()
 
-    keyword_map = {
-        "bitcoin": "BTC", "btc": "BTC", "比特币": "比特币行情",
-        "ethereum": "ETH", "eth": "ETH", "以太坊": "以太坊行情",
-        "solana": "SOL", "sol": "SOL",
-        "bnb": "BNB", "xrp": "XRP", "doge": "DOGE", "dogecoin": "DOGE",
-        "ada": "ADA", "cardano": "ADA", "link": "LINK", "chainlink": "LINK",
-        "avax": "AVAX", "avalanche": "AVAX", "trx": "TRX", "tron": "TRX",
-        "sui": "SUI", "pepe": "PEPE",
-        "meme": "MEME", "memecoin": "MEME", "altcoin": "山寨币", "altcoins": "山寨币",
-        "etf": "ETF", "sec": "SEC", "fed": "美联储", "federal reserve": "美联储",
-        "rate cut": "降息", "inflation": "通胀", "cpi": "CPI", "regulation": "监管",
-        "binance": "Binance", "okx": "OKX", "coinbase": "Coinbase", "listing": "新币上线",
-        "whale": "巨鲸监控", "wallet": "钱包监控", "on-chain": "链上监控", "onchain": "链上监控",
-        "inflow": "资金流向", "outflow": "资金流向", "liquidation": "爆仓监控",
-        "liquidations": "爆仓监控", "futures": "合约情绪",
-    }
+    scores = {}
 
     for source, title, summary, categories_raw, symbols_raw, published_at in rows:
+        title = clean_html(title or "")
+        summary = clean_html(summary or "")
         text = f"{title} {summary}"
-        if hotword_contains_blocked(text):
+        lower = text.lower()
+
+        if not title or hotword_contains_blocked(text):
             continue
 
         try:
@@ -1586,42 +1738,43 @@ def collect_hotword_candidates() -> List[dict]:
         if "airdrop" in categories:
             continue
 
-        try:
-            syms = json.loads(symbols_raw or "[]")
-        except Exception:
-            syms = []
+        evidence = {
+            "source": source or "RSS",
+            "title": short_text(title, 120),
+            "summary": short_text(summary, 180),
+            "categories": categories,
+            "published_at": published_at,
+        }
 
-        lower = text.lower()
-        for k, term in keyword_map.items():
-            if k in lower:
-                add_hotword_score(scores, term, 3.5, f"{source} 新闻标题多次出现相关热词")
+        # 时间越新，权重略高
+        age_hours = max((time.time() - (published_at or time.time())) / 3600, 0)
+        recency = max(0.6, 1.2 - age_hours / max(NEWS_LOOKBACK_HOURS, 1))
 
-        for s in syms:
-            if s and not hotword_contains_blocked(s):
-                add_hotword_score(scores, s, 4, f"{source} 新闻关联热搜币 {s}")
+        for pattern, canonical, category in HOTWORD_RSS_KEYWORD_RULES:
+            if is_hotword_primary_blocked(canonical):
+                continue
+            if hotword_term_in_text(pattern, lower):
+                add_hotword_score(scores, canonical, 3.0 * recency, category, evidence)
 
-        if "macro" in categories:
-            add_hotword_score(scores, "宏观监管", 3, "宏观与监管新闻热度较高")
-        if "exchange" in categories:
-            add_hotword_score(scores, "交易所监控", 3, "交易所公告和上新方向有搜索价值")
-        if "onchain" in categories:
-            add_hotword_score(scores, "链上监控", 3, "链上、巨鲸、资金流向属于高频搜索词")
-        if "altcoin" in categories:
-            add_hotword_score(scores, "山寨币监控", 3, "山寨币和板块轮动具备搜索曝光价值")
+    items = []
+    for item in scores.values():
+        evidence = item.get("evidence", [])
+        if len(evidence) < HOTWORD_MIN_RSS_EVIDENCE:
+            continue
+        item["sources"] = list(item.get("sources", []))
+        item["related_terms"] = []
+        # 多源加分、重复出现加分
+        item["score"] += min(len(evidence), 5) * 1.5
+        item["score"] += min(len(item["sources"]), 4) * 1.0
+        items.append(item)
 
-    # 3. 内置热词兜底：保证每天够 10 条
-    for i, term in enumerate(HOTWORD_TEXT_POOL):
-        add_hotword_score(scores, term, max(1, 4 - i * 0.04), "内置币圈热词池补充")
+    items.sort(key=lambda x: (x.get("score", 0), len(x.get("sources", [])), len(x.get("evidence", []))), reverse=True)
 
-    items = list(scores.values())
-    items.sort(key=lambda x: x["score"], reverse=True)
-
-    # 去掉语义过近的重复项
     final = []
     used = set()
     for item in items:
         term = item["term"]
-        key = term.upper().replace("行情", "").replace("监控", "")
+        key = term.upper()
         if key in used:
             continue
         used.add(key)
@@ -1629,33 +1782,62 @@ def collect_hotword_candidates() -> List[dict]:
         if len(final) >= max(HOTWORD_POSTS_PER_DAY * 2, 20):
             break
 
+    print("RSS 热词候选：", [(x["term"], round(x["score"], 2), len(x.get("evidence", []))) for x in final[:12]])
     return final
+
+
+def category_reason(term: str, category: str) -> str:
+    if category == "交易所热词":
+        return "交易所公告、上新、Launchpool 或活动信息会直接影响项目热度，也容易带动山寨币资金流向。"
+    if category == "合约热词":
+        return "合约、爆仓、持仓量和资金费率通常代表短线交易情绪，容易放大行情波动。"
+    if category == "链上热词":
+        return "链上资金、巨鲸钱包和交易所流入流出能帮助判断资金是否正在移动。"
+    if category in {"监管热词", "宏观热词"}:
+        return "监管、ETF、利率和宏观消息会影响市场风险偏好，也会改变主流资金的交易节奏。"
+    if category == "热搜币":
+        return f"{term} 出现在 RSS 新闻里，说明它具备独立事件或板块关注度，适合放进热搜币观察。"
+    if category == "板块热词":
+        return "板块叙事一旦被多家新闻源提到，通常会影响同类山寨币和相关项目的搜索热度。"
+    return "该词来自 RSS 新闻标题/摘要，属于当前币圈消息面里可观察的关键词。"
+
+
+def related_keywords_for_hotword(term: str, category: str) -> List[str]:
+    mapping = {
+        "交易所热词": [term, "交易所公告", "新币上线", "Launchpool", "山寨币"],
+        "合约热词": [term, "合约情绪", "爆仓监控", "多空变化", "短线波动"],
+        "链上热词": [term, "链上监控", "巨鲸", "资金流向", "交易所流入"],
+        "监管热词": [term, "SEC", "ETF", "监管", "交易所合规"],
+        "宏观热词": [term, "ETF", "美联储", "利率", "宏观监管"],
+        "热搜币": [term, "热搜币", "山寨币", "行情监控", "交易所动态"],
+        "板块热词": [term, "山寨币", "板块轮动", "资金情绪", "行情监控"],
+        "风险热词": [term, "风险监控", "链上安全", "交易所公告", "资金流向"],
+    }
+    kws = mapping.get(category, [term, "币圈热词", "行情监控", "市场消息", "交易所动态"])
+    kws = [x for x in unique_keep_order(kws) if x and not is_hotword_primary_blocked(x)]
+    return kws[:5]
 
 
 def build_hotword_fallback_post(item: dict, slot_no: int) -> dict:
     term = item.get("term", "币圈热词")
-    reasons = item.get("reasons", [])
-    reason = reasons[0] if reasons else "该词近期在行情监控、新闻标题和热搜币方向里出现频率较高。"
-    tags = hotword_tags_for_term(term)
+    category = item.get("category", "热词")
+    evidence = item.get("evidence", [])
+    tags = hotword_tags_for_term(term, category)
+    source_line = summarize_evidence(evidence)
+    related = "、".join(related_keywords_for_hotword(term, category)[:5])
+    reason = category_reason(term, category)
 
-    related_pool = HOTWORD_TEXT_POOL[:]
-    related_pool.extend([x.replace("#", "") for x in HOTWORD_TAG_POOL])
-    related_pool.append(term)
-    related_pool = [x for x in unique_keep_order(related_pool) if not hotword_contains_blocked(x)]
-    random.shuffle(related_pool)
-    related = "、".join(unique_keep_order([term] + related_pool[:5])[:5])
-
-    title_term = term
-    if len(title_term) > 12:
-        title_term = title_term[:12]
-
+    title_term = short_text(term, 12)
     content = f"""【币圈热词监控｜{title_term}】
 
-热词解读：
-{term} 近期在币圈监控、行情监控和热搜币方向里反复出现，说明市场注意力正在向这个关键词集中。
+热词来源：
+{source_line}，所以“{term}”被纳入本轮 RSS 热词候选。
 
 为什么值得看：
-{reason} 这类热词通常会影响主流币、山寨币、交易所公告或链上资金流向的搜索曝光。
+{reason}
+
+观察方向：
+后续重点看这个词是否继续出现在交易所公告、宏观监管、链上资金或山寨板块新闻里，避免只看单条消息。
 
 相关关键词：
 {related}
@@ -1673,7 +1855,7 @@ def build_hotword_fallback_post(item: dict, slot_no: int) -> dict:
 def extract_json_array(text: str):
     if not text:
         return None
-    m = re.search(r"\\[.*\\]", text, re.S)
+    m = re.search(r"\[.*\]", text, re.S)
     if not m:
         return None
     try:
@@ -1685,45 +1867,64 @@ def extract_json_array(text: str):
 def ai_generate_hotword_posts(candidates: List[dict]) -> Optional[List[dict]]:
     if not USE_AI_POLISH or not client:
         return None
+    if not candidates:
+        return None
 
     compact = []
     for item in candidates[:25]:
         compact.append({
             "term": item.get("term"),
+            "category": item.get("category"),
             "score": round(item.get("score", 0), 2),
-            "reasons": item.get("reasons", [])[:2],
+            "sources": item.get("sources", [])[:4],
+            "evidence": [
+                {
+                    "source": e.get("source"),
+                    "title": e.get("title"),
+                    "summary": e.get("summary"),
+                }
+                for e in item.get("evidence", [])[:3]
+            ],
         })
 
+    max_count = min(HOTWORD_POSTS_PER_DAY, len(compact))
     prompt = f"""
-请根据下面的币圈热词候选，生成 {HOTWORD_POSTS_PER_DAY} 条 Telegram 频道内容。
+你是 Telegram 币圈频道编辑。请根据下面 RSS 热词证据，生成 {max_count} 条“币圈热词监控”内容。
 
-栏目名固定为：币圈热词监控
-内容范围：只写热搜词、热搜币、行情热词、交易所热词、宏观监管热词、链上热词。
-禁止内容：不要写空投、撸毛、测试网、积分任务、白名单、Galxe、Layer3、Zealy。
-禁止稳定币：不要写 USDT、USDC、DAI、稳定币。
+硬性原则：
+1. 只能根据给定 RSS 标题/摘要证据写，不允许编造新闻、数据、项目进展。
+2. 不要写 BTC、ETH、BNB、XRP、SOL、TRX、DOGE、ADA、LINK、AVAX 作为热词标题。
+3. 不写空投、撸毛、测试网、积分任务、白名单、Galxe、Layer3、Zealy。
+4. 不写 USDT、USDC、DAI、稳定币。
+5. 禁止空话：不要写“市场注意力正在向这个关键词集中”“当前监控热搜币”“影响搜索曝光”“近期在币圈监控、行情监控里反复出现”。
+6. 每条必须有依据，必须出现“热词来源：”，并点明来自 RSS 标题/摘要或来源名称。
+7. 每条必须包含：热词来源、为什么值得看、观察方向、相关关键词。
+8. 每条最后一行 3-5 个标签，最多5个。
+9. 不要输出链接，不要输出英文长段，不要投资建议。
 
-每条必须使用清爽格式：
+固定格式：
 【币圈热词监控｜关键词】
 
-热词解读：
-1-2句，说明这个词为什么热，正文要自然包含“币圈监控”“行情监控”“热搜币”等关键词。
+热词来源：
+说明 RSS 证据来自哪些来源/标题摘要，不要照抄过长标题。
 
 为什么值得看：
-1-2句，结合主流币、山寨币、交易所、宏观或链上方向分析，不要投资建议。
+结合该热词对应的板块、交易所、合约、链上或监管影响，写具体点。
+
+观察方向：
+写接下来应该看什么消息是否继续发酵。
 
 相关关键词：
-3-5个相关关键词，用顿号分隔。
+3-5个，用顿号分隔。
 
-最后一行：
-3-5个标签，最多5个，不要超过5个。
+#标签1 #标签2 #标签3
 
-输出 JSON 数组，不要输出 JSON 以外的内容。
-每个对象格式：
+输出 JSON 数组，不要输出 JSON 以外内容：
 [
-  {{"title":"币圈热词监控｜BTC","hotword":"BTC","content":"完整频道文案"}}
+  {{"title":"币圈热词监控｜SEC","hotword":"SEC","content":"完整频道文案"}}
 ]
 
-候选热词：
+RSS 热词证据：
 {json.dumps(compact, ensure_ascii=False)}
 """.strip()
 
@@ -1735,52 +1936,57 @@ def ai_generate_hotword_posts(candidates: List[dict]) -> Optional[List[dict]]:
             return None
 
         result = []
-        for idx, obj in enumerate(arr[:HOTWORD_POSTS_PER_DAY], 1):
+        allowed_terms = {x.get("term") for x in candidates}
+        for idx, obj in enumerate(arr[:max_count], 1):
             if not isinstance(obj, dict):
                 continue
             title = clean_html(str(obj.get("title", ""))).strip()
             hotword = clean_html(str(obj.get("hotword", ""))).strip()
-            content = str(obj.get("content", "")).strip()
-            content = content.replace("...", "").replace("……", "")
-            content = re.sub(r"\\n{3,}", "\\n\\n", content)
+            content = str(obj.get("content", "")).strip().replace("...", "").replace("……", "")
+            content = re.sub(r"\n{3,}", "\n\n", content)
 
             if not title or not hotword or not content:
                 continue
-            if hotword_contains_blocked(content) or hotword_contains_blocked(title):
+            if is_hotword_primary_blocked(hotword) or is_hotword_primary_blocked(title.replace("币圈热词监控｜", "")):
+                continue
+            if hotword_contains_blocked(content) or hotword_low_quality(content):
+                continue
+            if "热词来源" not in content:
+                continue
+            if hotword not in allowed_terms and title.replace("币圈热词监控｜", "") not in allowed_terms:
+                # AI 如果新造了候选外热词，跳过
                 continue
             if "【币圈热词监控" not in content:
-                content = f"【{title}】\\n\\n{content}"
+                content = f"【{title}】\n\n{content}"
 
-            # 标签最多5个：如果最后一行太多，做一次粗略裁剪
+            # 标签最多5个
             parts = content.splitlines()
             if parts:
                 last = parts[-1].strip()
                 tags = [x for x in last.split() if x.startswith("#")]
                 if len(tags) > 5:
                     parts[-1] = " ".join(tags[:5])
-                    content = "\\n".join(parts)
+                    content = "\n".join(parts)
 
-            result.append({
-                "slot_no": idx,
-                "title": title,
-                "hotword": hotword,
-                "content": content,
-            })
+            result.append({"slot_no": idx, "title": title, "hotword": hotword, "content": content})
 
-        return result if len(result) >= min(5, HOTWORD_POSTS_PER_DAY) else None
+        return result if result else None
 
     except Exception as e:
-        print("AI 生成热词栏目失败，使用备用模板:", e)
+        print("AI 生成 RSS 热词栏目失败，使用证据模板:", e)
         return None
 
 
 def build_hotword_posts() -> List[dict]:
     candidates = collect_hotword_candidates()
-    posts = ai_generate_hotword_posts(candidates)
+    if not candidates:
+        print("没有足够 RSS 证据生成热词栏目，本日跳过热词队列")
+        return []
 
+    posts = ai_generate_hotword_posts(candidates)
     if posts:
-        # 如果 AI 没满10条，用备用补齐
-        if len(posts) < HOTWORD_POSTS_PER_DAY:
+        # AI 不足时，用证据模板补齐，但只用 RSS 有证据的候选
+        if len(posts) < min(HOTWORD_POSTS_PER_DAY, len(candidates)):
             used = {p.get("hotword") for p in posts}
             slot = len(posts) + 1
             for item in candidates:
@@ -1795,7 +2001,6 @@ def build_hotword_posts() -> List[dict]:
     fallback = []
     for idx, item in enumerate(candidates[:HOTWORD_POSTS_PER_DAY], 1):
         fallback.append(build_hotword_fallback_post(item, idx))
-
     return fallback[:HOTWORD_POSTS_PER_DAY]
 
 
@@ -2291,8 +2496,11 @@ def process_lm_column() -> bool:
         return False
 
     news_list = fetch_airdrop_news(limit=3) if ENABLE_AIRDROP_RSS else []
-    news = news_list[0] if news_list else None
+    if not news_list:
+        print("撸毛/空投栏目没有 RSS 证据，本轮跳过")
+        return False
 
+    news = news_list[0]
     message = build_airdrop_message(news)
     image = get_lm_image_path()
     resp = send_with_image(message, image)
