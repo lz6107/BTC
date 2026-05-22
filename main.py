@@ -92,6 +92,31 @@ FIRST_RUN_INIT_ONLY = os.getenv("FIRST_RUN_INIT_ONLY", "true").lower() == "true"
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
+# =========================
+# SQLite 连接工具：修复 database is locked
+# =========================
+
+DB_PATH = os.getenv("DB_PATH", "data.db")
+DB_TIMEOUT_SECONDS = float(os.getenv("DB_TIMEOUT_SECONDS", "30"))
+DB_BUSY_TIMEOUT_MS = int(os.getenv("DB_BUSY_TIMEOUT_MS", "30000"))
+
+
+def db_connect():
+    """
+    SQLite 默认并发写能力很弱。
+    Railway 上 RSS 更新、热词队列、扩展栏目队列同时写库时，容易出现 database is locked。
+    这里统一打开 WAL、busy_timeout，让短暂锁等待而不是直接崩溃。
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_SECONDS)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS};")
+    except Exception:
+        pass
+    return conn
+
+
 
 # =========================
 # 备用币种：排除稳定币后的市值大币兜底
@@ -343,7 +368,7 @@ HOTWORD_BLOCK_KEYWORDS = [
 # =========================
 
 def init_db():
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
 
     cur.execute("""
@@ -430,7 +455,7 @@ def init_db():
 
 
 def get_state(symbol: str):
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
         SELECT symbol, display, last_signal, last_support, last_resistance, last_event_key, last_sent_at, updated_at
@@ -467,7 +492,7 @@ def upsert_state(symbol: str, display: str, signal: str, support: float, resista
         final_event_key = event_key
         final_sent_at = sent_at or 0
 
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO coin_state (
@@ -492,7 +517,7 @@ def upsert_state(symbol: str, display: str, signal: str, support: float, resista
 
 
 def get_meta(key: str, default=None):
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("SELECT value FROM meta WHERE key = ?", (key,))
     row = cur.fetchone()
@@ -501,7 +526,7 @@ def get_meta(key: str, default=None):
 
 
 def set_meta(key: str, value: str):
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO meta(key, value)
@@ -513,7 +538,7 @@ def set_meta(key: str, value: str):
 
 
 def has_any_state() -> bool:
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM coin_state")
     count = cur.fetchone()[0]
@@ -522,7 +547,7 @@ def has_any_state() -> bool:
 
 
 def record_sent(kind: str, symbol: str = "", event_type: str = "", title: str = ""):
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO sent_log(kind, symbol, event_type, title, created_at)
@@ -533,7 +558,7 @@ def record_sent(kind: str, symbol: str = "", event_type: str = "", title: str = 
 
 
 def count_sent_since(kind: Optional[str], since_ts: float, symbol: Optional[str] = None) -> int:
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
 
     query = "SELECT COUNT(*) FROM sent_log WHERE created_at >= ?"
@@ -563,7 +588,7 @@ def symbol_posts_today(symbol: str) -> int:
 
 def total_posts_today() -> int:
     # 原有栏目频率保持不变：新增扩展栏目不占用原全局每日额度
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
         SELECT COUNT(*) FROM sent_log
@@ -577,7 +602,7 @@ def total_posts_today() -> int:
 
 def total_posts_last_hour() -> int:
     # 原有栏目频率保持不变：新增扩展栏目不占用原每小时额度
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
         SELECT COUNT(*) FROM sent_log
@@ -645,7 +670,7 @@ def enabled_extra_column_types() -> List[str]:
 
 
 def insert_news_item(item: dict):
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
         INSERT OR IGNORE INTO news_items(
@@ -669,18 +694,40 @@ def insert_news_item(item: dict):
 
 
 def mark_news_used(link: str):
-    conn = sqlite3.connect("data.db")
-    cur = conn.cursor()
-    cur.execute("UPDATE news_items SET used_count = used_count + 1 WHERE link = ?", (link,))
-    conn.commit()
-    conn.close()
+    if not link:
+        return
+
+    # 避免扩展栏目证据里出现占位 link 也去写库
+    if link.strip().lower() in {"link", "none", "null", "#"}:
+        return
+
+    for attempt in range(5):
+        conn = None
+        try:
+            conn = db_connect()
+            cur = conn.cursor()
+            cur.execute("UPDATE news_items SET used_count = used_count + 1 WHERE link = ?", (link,))
+            conn.commit()
+            conn.close()
+            return
+        except sqlite3.OperationalError as e:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if "locked" in str(e).lower() and attempt < 4:
+                time.sleep(0.4 * (attempt + 1))
+                continue
+            print("mark_news_used 写库失败:", e)
+            return
 
 
 def fetch_news_context(symbol: str, display: str, limit: int = 2) -> List[dict]:
     cutoff = time.time() - NEWS_LOOKBACK_HOURS * 3600
     display_lower = display.lower()
 
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
         SELECT link, source, title, summary, categories, symbols, used_count, published_at
@@ -742,7 +789,7 @@ def fetch_news_context(symbol: str, display: str, limit: int = 2) -> List[dict]:
 
 def fetch_airdrop_news(limit: int = 3) -> List[dict]:
     cutoff = time.time() - NEWS_LOOKBACK_HOURS * 3600
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
         SELECT link, source, title, summary, categories, symbols, used_count, published_at
@@ -1796,7 +1843,7 @@ def collect_hotword_candidates() -> List[dict]:
         print("热词生成前刷新 RSS 失败:", e)
 
     cutoff = time.time() - NEWS_LOOKBACK_HOURS * 3600
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
         SELECT source, title, summary, categories, symbols, published_at
@@ -2093,7 +2140,7 @@ def build_hotword_posts() -> List[dict]:
 
 
 def hotword_queue_count(date_key: str) -> int:
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM hotword_queue WHERE date_key = ?", (date_key,))
     count = cur.fetchone()[0]
@@ -2117,7 +2164,7 @@ def generate_hotword_queue_if_needed(force: bool = False):
     posts = build_hotword_posts()
     times = hotword_send_times()
 
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
 
     for idx, post in enumerate(posts[:HOTWORD_POSTS_PER_DAY], 1):
@@ -2149,7 +2196,7 @@ def fetch_due_hotword_post() -> Optional[dict]:
     date_key = current_date_key()
     now_hhmm = datetime.now().strftime("%H:%M")
 
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
         SELECT id, slot_no, send_time, title, hotword, content
@@ -2177,7 +2224,7 @@ def fetch_due_hotword_post() -> Optional[dict]:
 
 
 def mark_hotword_sent(row_id: int):
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
         UPDATE hotword_queue
@@ -2485,7 +2532,7 @@ def pick_extra_tags(column_type: str) -> str:
 
 
 def extra_column_queue_count(date_key: str) -> int:
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM extra_column_queue WHERE date_key = ?", (date_key,))
     count = cur.fetchone()[0]
@@ -2502,7 +2549,7 @@ def fetch_extra_column_evidence(column_type: str, limit: int = 3) -> List[dict]:
     if not rules:
         return []
 
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
         SELECT link, source, title, summary, categories, symbols, used_count, published_at
@@ -2724,31 +2771,65 @@ def generate_extra_column_queue_if_needed(force: bool = False):
         print("扩展栏目没有生成内容")
         return
 
-    conn = sqlite3.connect("data.db")
-    cur = conn.cursor()
-    for post in posts:
-        cur.execute("""
-            INSERT OR IGNORE INTO extra_column_queue(
-                date_key, slot_no, send_time, column_type, title, content, image_name, status, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-        """, (
-            date_key,
-            post["slot_no"],
-            post["send_time"],
-            post["column_type"],
-            post.get("title", ""),
-            post["content"],
-            post.get("image_name", ""),
-            time.time(),
-        ))
-        for n in post.get("evidence", []):
-            if n.get("link"):
-                mark_news_used(n["link"])
-    conn.commit()
-    conn.close()
-    print("扩展栏目队列已生成", len(posts), "条")
+    # 关键修复：
+    # 旧版在这个事务里调用 mark_news_used()，mark_news_used 会重新打开一个 SQLite 连接写 news_items，
+    # 等于一个写事务没提交时又开另一个写事务，很容易 database is locked。
+    # 这里统一用当前 cursor 更新 used_count，避免嵌套写库。
+    for attempt in range(5):
+        conn = None
+        try:
+            conn = db_connect()
+            cur = conn.cursor()
 
+            for post in posts:
+                cur.execute("""
+                    INSERT OR IGNORE INTO extra_column_queue(
+                        date_key, slot_no, send_time, column_type, title, content, image_name, status, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                """, (
+                    date_key,
+                    post["slot_no"],
+                    post["send_time"],
+                    post["column_type"],
+                    post.get("title", ""),
+                    post["content"],
+                    post.get("image_name", ""),
+                    time.time(),
+                ))
+
+                for n in post.get("evidence", []):
+                    link = (n.get("link") or "").strip()
+                    if link and link.lower() not in {"link", "none", "null", "#"}:
+                        cur.execute("UPDATE news_items SET used_count = used_count + 1 WHERE link = ?", (link,))
+
+            conn.commit()
+            conn.close()
+            print("扩展栏目队列已生成", len(posts), "条")
+            return
+
+        except sqlite3.OperationalError as e:
+            if conn:
+                try:
+                    conn.rollback()
+                    conn.close()
+                except Exception:
+                    pass
+            if "locked" in str(e).lower() and attempt < 4:
+                print(f"扩展栏目写库遇到锁，等待重试 {attempt + 1}/5")
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            print("扩展栏目队列写库失败:", e)
+            return
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                    conn.close()
+                except Exception:
+                    pass
+            print("扩展栏目队列生成失败:", e)
+            return
 
 def fetch_due_extra_column_post() -> Optional[dict]:
     if not extra_column_enabled():
@@ -2758,7 +2839,7 @@ def fetch_due_extra_column_post() -> Optional[dict]:
     now_minutes = now.hour * 60 + now.minute
     date_key = current_date_key()
 
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
         SELECT id, slot_no, send_time, column_type, title, content, image_name
@@ -2787,7 +2868,7 @@ def fetch_due_extra_column_post() -> Optional[dict]:
 
 
 def mark_extra_column_sent(row_id: int):
-    conn = sqlite3.connect("data.db")
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
         UPDATE extra_column_queue
@@ -3078,10 +3159,20 @@ def main():
         raise ValueError("缺少环境变量 CHAT_ID")
 
     init_db()
-    refresh_symbols_if_needed(force=True)
-    update_news_cache(force=True)
-    generate_hotword_queue_if_needed(force=True)
-    generate_extra_column_queue_if_needed(force=True)
+
+    # 启动阶段会集中写库，逐个保护，避免某一步 database is locked 直接把服务打崩
+    for name, func in [
+        ("刷新市值币种", lambda: refresh_symbols_if_needed(force=True)),
+        ("更新新闻 RSS", lambda: update_news_cache(force=True)),
+        ("生成热词队列", lambda: generate_hotword_queue_if_needed(force=True)),
+        ("生成扩展栏目队列", lambda: generate_extra_column_queue_if_needed(force=True)),
+    ]:
+        try:
+            func()
+        except sqlite3.OperationalError as e:
+            print(f"启动阶段{name}遇到数据库锁，跳过本次，下一轮会自动重试:", e)
+        except Exception as e:
+            print(f"启动阶段{name}失败，下一轮会自动重试:", e)
 
     print("币圈监控小助手启动成功（10币 + 新闻行情 + 空投RSS + 热词监控 + 扩展栏目 + 控频重构版）")
     print("频道:", CHAT_ID)
