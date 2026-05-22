@@ -70,6 +70,18 @@ HOTWORD_EXTRA_EXCLUDE = os.getenv("HOTWORD_EXTRA_EXCLUDE", "BTC,ETH,BNB,XRP,SOL,
 HOTWORD_MIN_RSS_EVIDENCE = int(os.getenv("HOTWORD_MIN_RSS_EVIDENCE", "1"))
 HOTWORD_MAX_EVIDENCE_PER_TERM = int(os.getenv("HOTWORD_MAX_EVIDENCE_PER_TERM", "5"))
 
+# 新增：扩展栏目（不改变原有栏目频率，额外每天 3-5 条）
+ENABLE_EXTRA_COLUMNS = os.getenv("ENABLE_EXTRA_COLUMNS", "true").lower() == "true"
+EXTRA_COLUMN_POSTS_PER_DAY = int(os.getenv("EXTRA_COLUMN_POSTS_PER_DAY", "4"))
+EXTRA_COLUMN_SEND_TIMES = os.getenv("EXTRA_COLUMN_SEND_TIMES", "11:20,14:20,17:20,20:20,22:20")
+EXTRA_COLUMN_MIN_INTERVAL_SECONDS = int(os.getenv("EXTRA_COLUMN_MIN_INTERVAL_SECONDS", "900"))
+EXTRA_COLUMN_TYPES = os.getenv("EXTRA_COLUMN_TYPES", "exchange,contract,sector,wiki")
+
+EXCHANGE_IMAGE = os.getenv("EXCHANGE_IMAGE", "exchange.png")
+CONTRACT_IMAGE = os.getenv("CONTRACT_IMAGE", "contract.png")
+SECTOR_IMAGE = os.getenv("SECTOR_IMAGE", "sector.png")
+WIKI_IMAGE = os.getenv("WIKI_IMAGE", "wiki.png")
+
 # 动态市值前十
 ENABLE_DYNAMIC_TOP_COINS = os.getenv("ENABLE_DYNAMIC_TOP_COINS", "true").lower() == "true"
 SYMBOL_REFRESH_INTERVAL = int(os.getenv("SYMBOL_REFRESH_INTERVAL", "21600"))  # 6小时刷新一次
@@ -227,6 +239,15 @@ NEWS_RSS_FEEDS = [
     ("CryptoNews-Airdrop", "https://crypto.news/tag/airdrop/feed/"),
     ("DappRadar-Airdrops", "https://dappradar.com/blog/category/airdrops/feed/"),
     ("DappRadar-Rewards", "https://dappradar.com/blog/category/rewards/feed/"),
+]
+
+# 扩展栏目新闻源：只作为交易所、合约情绪、山寨板块雷达的素材，不单独刷屏
+EXTRA_COLUMN_RSS_FEEDS = [
+    ("GoogleNews-BinanceListing", "https://news.google.com/rss/search?q=Binance+listing+Launchpool+crypto&hl=en-US&gl=US&ceid=US:en"),
+    ("GoogleNews-OKXListing", "https://news.google.com/rss/search?q=OKX+listing+crypto+exchange&hl=en-US&gl=US&ceid=US:en"),
+    ("GoogleNews-CoinbaseListing", "https://news.google.com/rss/search?q=Coinbase+listing+crypto&hl=en-US&gl=US&ceid=US:en"),
+    ("GoogleNews-Liquidation", "https://news.google.com/rss/search?q=crypto+liquidation+futures+open+interest&hl=en-US&gl=US&ceid=US:en"),
+    ("GoogleNews-MemeAI", "https://news.google.com/rss/search?q=crypto+MEME+AI+tokens+RWA+DePIN&hl=en-US&gl=US&ceid=US:en"),
 ]
 
 AIRDROP_RSS_FEEDS = [
@@ -387,6 +408,23 @@ def init_db():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS extra_column_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date_key TEXT NOT NULL,
+            slot_no INTEGER NOT NULL,
+            send_time TEXT NOT NULL,
+            column_type TEXT NOT NULL,
+            title TEXT,
+            content TEXT NOT NULL,
+            image_name TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at REAL,
+            sent_at REAL,
+            UNIQUE(date_key, slot_no)
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -524,11 +562,35 @@ def symbol_posts_today(symbol: str) -> int:
 
 
 def total_posts_today() -> int:
-    return count_sent_since(None, today_start_ts())
+    # 原有栏目频率保持不变：新增扩展栏目不占用原全局每日额度
+    conn = sqlite3.connect("data.db")
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*) FROM sent_log
+        WHERE created_at >= ?
+          AND kind != 'extra_column'
+    """, (today_start_ts(),))
+    count = cur.fetchone()[0]
+    conn.close()
+    return count
 
 
 def total_posts_last_hour() -> int:
-    return count_sent_since(None, time.time() - 3600)
+    # 原有栏目频率保持不变：新增扩展栏目不占用原每小时额度
+    conn = sqlite3.connect("data.db")
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*) FROM sent_log
+        WHERE created_at >= ?
+          AND kind != 'extra_column'
+    """, (time.time() - 3600,))
+    count = cur.fetchone()[0]
+    conn.close()
+    return count
+
+
+def extra_column_posts_today() -> int:
+    return count_sent_since("extra_column", today_start_ts())
 
 
 def current_date_key() -> str:
@@ -556,6 +618,30 @@ def hotword_send_times() -> List[str]:
 
     seen.sort(key=parse_hhmm_to_minutes)
     return seen[:HOTWORD_POSTS_PER_DAY]
+
+
+def extra_column_send_times() -> List[str]:
+    raw = [x.strip() for x in EXTRA_COLUMN_SEND_TIMES.split(",") if x.strip()]
+    if not raw:
+        raw = ["11:20", "14:20", "17:20", "20:20", "22:20"]
+
+    seen = []
+    for x in raw:
+        if re.match(r"^\d{1,2}:\d{2}$", x) and x not in seen:
+            seen.append(x)
+
+    seen.sort(key=parse_hhmm_to_minutes)
+    return seen[:max(1, EXTRA_COLUMN_POSTS_PER_DAY)]
+
+
+def enabled_extra_column_types() -> List[str]:
+    allowed = {"exchange", "contract", "sector", "wiki"}
+    result = []
+    for x in split_env_list(EXTRA_COLUMN_TYPES):
+        x = x.lower().strip()
+        if x in allowed and x not in result:
+            result.append(x)
+    return result or ["exchange", "contract", "sector", "wiki"]
 
 
 def insert_news_item(item: dict):
@@ -1191,6 +1277,8 @@ def update_news_cache(force: bool = False):
         return
 
     feeds = NEWS_RSS_FEEDS[:]
+    if ENABLE_EXTRA_COLUMNS:
+        feeds.extend(EXTRA_COLUMN_RSS_FEEDS)
     if ENABLE_AIRDROP_RSS:
         feeds.extend(AIRDROP_RSS_FEEDS)
 
@@ -2282,6 +2370,467 @@ def build_airdrop_message(news: Optional[dict]) -> str:
     return fallback_airdrop_content(news, tags)
 
 
+
+# =========================
+# 扩展栏目：交易所监控 / 合约情绪 / 山寨板块雷达 / 币圈小词典
+# 新增栏目合计每天 3-5 条，不占用原有栏目频率
+# =========================
+
+EXTRA_COLUMN_META = {
+    "exchange": {
+        "name": "交易所监控",
+        "image": EXCHANGE_IMAGE,
+        "tags": ["#交易所监控", "#Binance", "#OKX", "#新币上线", "#Launchpool", "#交易所公告"],
+        "keywords": ["Binance", "OKX", "Coinbase", "新币上线", "Launchpool", "Launchpad", "交易所公告", "上新监控"],
+    },
+    "contract": {
+        "name": "合约情绪监控",
+        "image": CONTRACT_IMAGE,
+        "tags": ["#合约", "#爆仓监控", "#多空变化", "#洗盘", "#资金费率", "#行情异动"],
+        "keywords": ["爆仓", "合约", "多空", "洗盘", "杠杆情绪", "资金费率", "持仓量", "短线波动"],
+    },
+    "sector": {
+        "name": "山寨板块雷达",
+        "image": SECTOR_IMAGE,
+        "tags": ["#山寨雷达", "#山寨币", "#MEME", "#AI币", "#RWA", "#板块轮动"],
+        "keywords": ["山寨币", "MEME", "AI币", "RWA", "DePIN", "GameFi", "Layer2", "Restaking", "公链生态"],
+    },
+    "wiki": {
+        "name": "币圈小词典",
+        "image": WIKI_IMAGE,
+        "tags": ["#币圈小词典", "#新手科普", "#币圈监控", "#行情监控", "#资金安全"],
+        "keywords": ["合约爆仓", "资金费率", "Launchpool", "新币上线", "测试网交互", "空投", "支撑压力", "链上监控"],
+    },
+}
+
+EXTRA_COLUMN_KEYWORD_RULES = {
+    "exchange": [
+        "binance", "okx", "coinbase", "kraken", "bybit", "listing", "listed", "launchpool", "launchpad",
+        "exchange", "new token", "new listing", "交易所", "上新", "新币上线", "公告",
+    ],
+    "contract": [
+        "liquidation", "liquidations", "futures", "perpetual", "open interest", "funding rate", "leverage",
+        "longs", "shorts", "爆仓", "合约", "多空", "洗盘", "资金费率", "持仓量", "杠杆",
+    ],
+    "sector": [
+        "meme", "memecoin", "memecoins", "ai token", "ai tokens", "rwa", "depin", "gamefi", "layer 2",
+        "restaking", "altcoin", "altcoins", "solana ecosystem", "defi", "nft", "山寨", "山寨币", "板块", "公链",
+    ],
+}
+
+WIKI_TOPICS = [
+    {
+        "title": "币圈小词典｜合约爆仓",
+        "body": "合约爆仓不是单纯亏损，而是保证金不足时仓位被强制平掉。币圈里看到爆仓、合约、多空、洗盘这些词一起出现，通常说明短线杠杆情绪升温，行情更容易出现急拉急跌。",
+        "keywords": "合约爆仓、杠杆情绪、多空变化、洗盘、风险监控",
+        "tags": "#合约爆仓 #币圈小词典 #多空变化 #风险监控",
+    },
+    {
+        "title": "币圈小词典｜资金费率",
+        "body": "资金费率可以理解为合约多空双方的情绪温度。费率持续偏高，说明追多情绪偏热；费率持续偏低，说明空头更拥挤。它不能单独判断涨跌，但适合配合持仓量、成交量和支撑压力一起看。",
+        "keywords": "资金费率、合约情绪、持仓量、多空变化、行情监控",
+        "tags": "#资金费率 #合约 #币圈小词典 #行情监控",
+    },
+    {
+        "title": "币圈小词典｜Launchpool",
+        "body": "Launchpool 常见于交易所新币活动，用户通过质押指定资产参与新币分发。它本身不等于项目一定上涨，但会带来新币上线、交易所公告、活动任务和山寨币热度。",
+        "keywords": "Launchpool、新币上线、交易所公告、Binance、上新监控",
+        "tags": "#Launchpool #新币上线 #交易所监控 #币圈小词典",
+    },
+    {
+        "title": "币圈小词典｜支撑压力",
+        "body": "支撑压力是短线行情监控里最常用的观察点。支撑附近看承接，压力附近看放量突破。单看一个价位意义不大，更重要的是成交量、K线结构和市场情绪是否配合。",
+        "keywords": "支撑压力、行情监控、短线结构、成交量、盘面观察",
+        "tags": "#支撑压力 #行情监控 #短线结构 #币圈小词典",
+    },
+    {
+        "title": "币圈小词典｜链上监控",
+        "body": "链上监控主要看钱包地址、交易所流入流出、巨鲸转账和资金流向。它不一定马上反映到价格上，但经常能帮助判断资金是在进场、撤离，还是准备制造短线波动。",
+        "keywords": "链上监控、巨鲸监控、资金流向、钱包监控、交易所流入",
+        "tags": "#链上监控 #巨鲸监控 #资金流向 #币圈小词典",
+    },
+    {
+        "title": "币圈小词典｜测试网交互",
+        "body": "测试网交互通常出现在空投和早期项目任务里，比如领水、转账、Swap、Mint、做任务验证等。重点不是乱点链接，而是看项目官网、任务入口、钱包交互成本和积分记录是否清晰。",
+        "keywords": "测试网交互、空投、撸毛、积分任务、钱包交互",
+        "tags": "#测试网交互 #空投 #撸毛 #币圈小词典",
+    },
+]
+
+
+def extra_column_enabled() -> bool:
+    return ENABLE_EXTRA_COLUMNS and EXTRA_COLUMN_POSTS_PER_DAY > 0
+
+
+def extra_column_image_path(column_type: str) -> str:
+    meta = EXTRA_COLUMN_META.get(column_type, {})
+    filename = meta.get("image") or FALLBACK_MARKET_IMAGE
+    path = image_path(filename)
+    if os.path.isfile(path):
+        return path
+
+    fallback = image_path(FALLBACK_MARKET_IMAGE)
+    if os.path.isfile(fallback):
+        return fallback
+
+    return ""
+
+
+def pick_extra_tags(column_type: str) -> str:
+    meta = EXTRA_COLUMN_META.get(column_type, {})
+    base = meta.get("tags", [])[:]
+    random.shuffle(base)
+    target = random.randint(3, 5)
+    return " ".join(unique_keep_order(base)[:target])
+
+
+def extra_column_queue_count(date_key: str) -> int:
+    conn = sqlite3.connect("data.db")
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM extra_column_queue WHERE date_key = ?", (date_key,))
+    count = cur.fetchone()[0]
+    conn.close()
+    return count
+
+
+def fetch_extra_column_evidence(column_type: str, limit: int = 3) -> List[dict]:
+    if column_type == "wiki":
+        return []
+
+    cutoff = time.time() - NEWS_LOOKBACK_HOURS * 3600
+    rules = EXTRA_COLUMN_KEYWORD_RULES.get(column_type, [])
+    if not rules:
+        return []
+
+    conn = sqlite3.connect("data.db")
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT link, source, title, summary, categories, symbols, used_count, published_at
+        FROM news_items
+        WHERE published_at >= ?
+        ORDER BY used_count ASC, published_at DESC
+        LIMIT 120
+    """, (cutoff,))
+    rows = cur.fetchall()
+    conn.close()
+
+    scored = []
+    for row in rows:
+        link, source, title, summary, categories_raw, symbols_raw, used_count, published_at = row
+        text = f"{title} {summary}".lower()
+        if hotword_contains_blocked(text) and column_type != "sector":
+            continue
+
+        score = 0
+        for rule in rules:
+            if hotword_term_in_text(rule, text):
+                score += 2
+
+        try:
+            categories = json.loads(categories_raw or "[]")
+        except Exception:
+            categories = []
+
+        if column_type == "exchange" and "exchange" in categories:
+            score += 3
+        elif column_type == "contract" and ("onchain" in categories or "macro" in categories):
+            score += 1
+        elif column_type == "sector" and "altcoin" in categories:
+            score += 3
+
+        if score > 0:
+            scored.append({
+                "link": link,
+                "source": source,
+                "title": title,
+                "summary": summary,
+                "categories": categories,
+                "used_count": used_count,
+                "published_at": published_at,
+                "score": score,
+            })
+
+    scored.sort(key=lambda x: (x["score"], -x["used_count"], x["published_at"]), reverse=True)
+    return scored[:limit]
+
+
+def evidence_line(evidence: List[dict]) -> str:
+    if not evidence:
+        return "当前没有强新闻触发，主要按栏目关键词和盘面关注度做观察。"
+
+    parts = []
+    for n in evidence[:2]:
+        source = n.get("source", "RSS")
+        title = clean_html(n.get("title", ""))
+        if title:
+            parts.append(f"{source} 提到：{title}")
+    return "；".join(parts) if parts else "RSS 新闻出现相关线索，适合继续观察。"
+
+
+def ai_generate_extra_column_content(column_type: str, evidence: List[dict], tags: str) -> Optional[str]:
+    if not USE_AI_POLISH or not client:
+        return None
+
+    meta = EXTRA_COLUMN_META.get(column_type, {})
+    name = meta.get("name", "币圈观察")
+    keywords = "、".join(meta.get("keywords", [])[:8])
+    ev = evidence_line(evidence)
+
+    prompt = f"""
+请生成一条 Telegram 币圈频道栏目内容。
+
+栏目：{name}
+栏目关键词：{keywords}
+消息依据：{ev}
+标签：{tags}
+
+固定格式：
+【{name}｜短标题】
+
+快讯观察：2句，写得像币圈资讯，不要像教程广告。
+盘面重点：1句，说明为什么值得看。
+相关关键词：列出4-6个中文关键词，用顿号分隔。
+
+{tags}
+
+硬性要求：
+1. 总字数控制在 180-320 个中文字符
+2. 不要喊单，不要投资建议，不要承诺涨跌
+3. 没有明确消息依据时，不要伪装成真实突发新闻，只写“观察”“可关注”“关键词方向”
+4. 正文自然包含栏目关键词，不要堆砌
+5. 最后一行必须原样使用这些标签：{tags}
+""".strip()
+
+    try:
+        response = client.responses.create(model=MODEL_NAME, input=prompt)
+        text = (response.output_text or "").strip()
+        text = text.replace("...", "").replace("……", "")
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        if 80 <= len(text) <= 900:
+            return text
+    except Exception as e:
+        print("AI 生成扩展栏目失败，使用备用模板:", e)
+
+    return None
+
+
+def fallback_extra_column_content(column_type: str, evidence: List[dict], tags: str, slot_no: int) -> str:
+    if column_type == "wiki":
+        topic = WIKI_TOPICS[(slot_no - 1) % len(WIKI_TOPICS)]
+        return f"""【{topic['title']}】
+
+简单说：
+{topic['body']}
+
+相关关键词：
+{topic['keywords']}
+
+{topic['tags']}""".strip()
+
+    ev = evidence_line(evidence)
+
+    if column_type == "exchange":
+        return f"""【交易所监控｜上新观察】
+
+快讯观察：
+交易所上新、Launchpool、Launchpad 和活动任务，一直是山寨币热度的重要入口。{ev}
+
+盘面重点：
+重点看 Binance、OKX、Coinbase 相关公告，是否带动同板块项目出现短线关注。
+
+相关关键词：
+Binance、OKX、新币上线、Launchpool、交易所公告
+
+{tags}""".strip()
+
+    if column_type == "contract":
+        return f"""【合约情绪监控｜爆仓观察】
+
+快讯观察：
+爆仓、合约、多空、洗盘这些词一旦集中出现，通常说明短线杠杆情绪升温。{ev}
+
+盘面重点：
+如果 BTC 和 ETH 没有明确方向，山寨币更容易被合约情绪带动，出现快速拉升或急跌。
+
+相关关键词：
+爆仓、合约、多空、洗盘、资金费率
+
+{tags}""".strip()
+
+    return f"""【山寨板块雷达｜板块观察】
+
+快讯观察：
+山寨币、MEME、AI币、RWA、DePIN、Layer2 这些板块词一旦和 RSS 新闻同时出现，说明市场注意力不只停留在主流币。{ev}
+
+盘面重点：
+如果 BTC 没有明显走弱，高弹性板块更容易获得短线资金关注。
+
+相关关键词：
+山寨币、MEME、AI币、RWA、板块轮动
+
+{tags}""".strip()
+
+
+def build_extra_column_posts() -> List[dict]:
+    types = enabled_extra_column_types()
+    times = extra_column_send_times()
+    total = min(EXTRA_COLUMN_POSTS_PER_DAY, len(times))
+    if total <= 0:
+        return []
+
+    # 按日期轮换起始栏目，避免每天顺序完全一样
+    day_offset = int(current_date_key()) % max(1, len(types))
+    rotated = types[day_offset:] + types[:day_offset]
+    posts = []
+
+    for idx in range(total):
+        column_type = rotated[idx % len(rotated)]
+        tags = pick_extra_tags(column_type)
+        evidence = fetch_extra_column_evidence(column_type, limit=3)
+        content = ai_generate_extra_column_content(column_type, evidence, tags)
+        if not content:
+            content = fallback_extra_column_content(column_type, evidence, tags, idx + 1)
+
+        image_name = EXTRA_COLUMN_META.get(column_type, {}).get("image", FALLBACK_MARKET_IMAGE)
+        title_match = re.search(r"【(.+?)】", content)
+        title = title_match.group(1) if title_match else EXTRA_COLUMN_META.get(column_type, {}).get("name", "扩展栏目")
+
+        posts.append({
+            "slot_no": idx + 1,
+            "send_time": times[idx],
+            "column_type": column_type,
+            "title": title,
+            "content": content,
+            "image_name": image_name,
+            "evidence": evidence,
+        })
+
+    return posts
+
+
+def generate_extra_column_queue_if_needed(force: bool = False):
+    if not extra_column_enabled():
+        return
+
+    date_key = current_date_key()
+    current_count = extra_column_queue_count(date_key)
+    if not force and current_count >= EXTRA_COLUMN_POSTS_PER_DAY:
+        return
+    if current_count >= EXTRA_COLUMN_POSTS_PER_DAY:
+        return
+
+    posts = build_extra_column_posts()
+    if not posts:
+        print("扩展栏目没有生成内容")
+        return
+
+    conn = sqlite3.connect("data.db")
+    cur = conn.cursor()
+    for post in posts:
+        cur.execute("""
+            INSERT OR IGNORE INTO extra_column_queue(
+                date_key, slot_no, send_time, column_type, title, content, image_name, status, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+        """, (
+            date_key,
+            post["slot_no"],
+            post["send_time"],
+            post["column_type"],
+            post.get("title", ""),
+            post["content"],
+            post.get("image_name", ""),
+            time.time(),
+        ))
+        for n in post.get("evidence", []):
+            if n.get("link"):
+                mark_news_used(n["link"])
+    conn.commit()
+    conn.close()
+    print("扩展栏目队列已生成", len(posts), "条")
+
+
+def fetch_due_extra_column_post() -> Optional[dict]:
+    if not extra_column_enabled():
+        return None
+
+    now = datetime.now()
+    now_minutes = now.hour * 60 + now.minute
+    date_key = current_date_key()
+
+    conn = sqlite3.connect("data.db")
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, slot_no, send_time, column_type, title, content, image_name
+        FROM extra_column_queue
+        WHERE date_key = ?
+          AND status = 'pending'
+        ORDER BY slot_no ASC
+    """, (date_key,))
+    rows = cur.fetchall()
+    conn.close()
+
+    for row in rows:
+        send_minutes = parse_hhmm_to_minutes(row[2])
+        if now_minutes >= send_minutes:
+            return {
+                "id": row[0],
+                "slot_no": row[1],
+                "send_time": row[2],
+                "column_type": row[3],
+                "title": row[4],
+                "content": row[5],
+                "image_name": row[6],
+            }
+
+    return None
+
+
+def mark_extra_column_sent(row_id: int):
+    conn = sqlite3.connect("data.db")
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE extra_column_queue
+        SET status = 'sent', sent_at = ?
+        WHERE id = ?
+    """, (time.time(), row_id))
+    conn.commit()
+    conn.close()
+
+
+def process_extra_columns() -> bool:
+    if not extra_column_enabled():
+        return False
+
+    generate_extra_column_queue_if_needed(force=False)
+
+    if extra_column_posts_today() >= EXTRA_COLUMN_POSTS_PER_DAY:
+        return False
+
+    last = float(get_meta("last_extra_column_sent_at", "0") or 0)
+    if time.time() - last < EXTRA_COLUMN_MIN_INTERVAL_SECONDS:
+        return False
+
+    row = fetch_due_extra_column_post()
+    if not row:
+        return False
+
+    image = image_path(row.get("image_name") or FALLBACK_MARKET_IMAGE)
+    if not os.path.isfile(image):
+        image = extra_column_image_path(row.get("column_type", ""))
+
+    resp = send_with_image(row["content"], image)
+    if resp.status_code == 200:
+        set_meta("last_extra_column_sent_at", str(time.time()))
+        record_sent("extra_column", "", row.get("column_type", "extra"), title=row.get("title", "")[:80])
+        mark_extra_column_sent(row["id"])
+        print("扩展栏目已发送:", row.get("title"))
+        return True
+
+    print("扩展栏目发送失败")
+    return False
+
+
 # =========================
 # 图片与 Telegram
 # =========================
@@ -2532,8 +3081,9 @@ def main():
     refresh_symbols_if_needed(force=True)
     update_news_cache(force=True)
     generate_hotword_queue_if_needed(force=True)
+    generate_extra_column_queue_if_needed(force=True)
 
-    print("币圈监控小助手启动成功（10币 + 新闻行情 + 空投RSS + 热词监控 + 控频重构版）")
+    print("币圈监控小助手启动成功（10币 + 新闻行情 + 空投RSS + 热词监控 + 扩展栏目 + 控频重构版）")
     print("频道:", CHAT_ID)
     print("当前监控:", ", ".join([f"{v}({k})" for k, v in SYMBOLS.items()]))
     print("图片目录:", IMAGES_DIR)
@@ -2548,6 +3098,10 @@ def main():
     print("币圈热词监控:", "开启" if ENABLE_HOTWORD_COLUMN else "关闭")
     print("热词配图:", HOTWORD_IMAGE)
     print("热词发送时间:", ", ".join(hotword_send_times()))
+    print("扩展栏目:", "开启" if ENABLE_EXTRA_COLUMNS else "关闭")
+    print("扩展栏目类型:", ", ".join(enabled_extra_column_types()))
+    print("扩展栏目每日:", EXTRA_COLUMN_POSTS_PER_DAY, "条")
+    print("扩展栏目发送时间:", ", ".join(extra_column_send_times()))
 
     if not has_any_state():
         print("首次启动：将初始化币种状态，避免一启动就刷旧信号")
@@ -2569,6 +3123,11 @@ def main():
             process_hotword_column()
         except Exception as e:
             print("币圈热词监控处理失败:", e)
+
+        try:
+            process_extra_columns()
+        except Exception as e:
+            print("扩展栏目处理失败:", e)
 
         try:
             sent_market = process_market_posts()
