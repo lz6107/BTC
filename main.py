@@ -8,6 +8,7 @@ import sqlite3
 import hashlib
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
 import feedparser
@@ -89,6 +90,17 @@ TOP_COIN_COUNT = int(os.getenv("TOP_COIN_COUNT", "10"))
 
 # 首次启动只初始化，不发旧信号
 FIRST_RUN_INIT_ONLY = os.getenv("FIRST_RUN_INIT_ONLY", "true").lower() == "true"
+
+# 流量转化：给 Telegram 帖子加按钮和可复盘的来源参数
+ENABLE_TRAFFIC_BUTTON = os.getenv("ENABLE_TRAFFIC_BUTTON", "true").lower() == "true"
+TRAFFIC_CTA_URL = os.getenv("TRAFFIC_CTA_URL", "").strip()
+TRAFFIC_CTA_TEXT = os.getenv("TRAFFIC_CTA_TEXT", "查看更多").strip() or "查看更多"
+TRAFFIC_SECONDARY_URL = os.getenv("TRAFFIC_SECONDARY_URL", "").strip()
+TRAFFIC_SECONDARY_TEXT = os.getenv("TRAFFIC_SECONDARY_TEXT", "加入频道").strip() or "加入频道"
+TRAFFIC_CAMPAIGN = os.getenv("TRAFFIC_CAMPAIGN", "btc_telegram").strip() or "btc_telegram"
+TRAFFIC_REF_PARAM = os.getenv("TRAFFIC_REF_PARAM", "ref").strip() or "ref"
+TRAFFIC_UTM_SOURCE = os.getenv("TRAFFIC_UTM_SOURCE", "telegram").strip() or "telegram"
+TRAFFIC_UTM_MEDIUM = os.getenv("TRAFFIC_UTM_MEDIUM", "channel").strip() or "channel"
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -367,6 +379,13 @@ HOTWORD_BLOCK_KEYWORDS = [
 # 数据库
 # =========================
 
+def ensure_column(cur, table: str, column: str, definition: str):
+    cur.execute(f"PRAGMA table_info({table})")
+    existing = {row[1] for row in cur.fetchall()}
+    if column not in existing:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def init_db():
     conn = db_connect()
     cur = conn.cursor()
@@ -401,6 +420,16 @@ def init_db():
             created_at REAL
         )
     """)
+
+    ensure_column(cur, "sent_log", "traffic_key", "TEXT")
+    ensure_column(cur, "sent_log", "cta_url", "TEXT")
+    ensure_column(cur, "sent_log", "status_code", "INTEGER")
+    ensure_column(cur, "sent_log", "telegram_ok", "INTEGER DEFAULT 0")
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sent_log_created_at ON sent_log(created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sent_log_kind_created_at ON sent_log(kind, created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sent_log_symbol_created_at ON sent_log(symbol, created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sent_log_traffic_key ON sent_log(traffic_key)")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS news_items (
@@ -546,13 +575,23 @@ def has_any_state() -> bool:
     return count > 0
 
 
-def record_sent(kind: str, symbol: str = "", event_type: str = "", title: str = ""):
+def record_sent(kind: str, symbol: str = "", event_type: str = "", title: str = "",
+                status_code: Optional[int] = None, telegram_ok: bool = True):
+    traffic_key = build_traffic_key(kind, symbol=symbol, event_type=event_type, title=title)
+    cta_url = append_tracking_params(TRAFFIC_CTA_URL, traffic_key) if TRAFFIC_CTA_URL else ""
+
     conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO sent_log(kind, symbol, event_type, title, created_at)
-        VALUES (?, ?, ?, ?, ?)
-    """, (kind, symbol, event_type, title, time.time()))
+        INSERT INTO sent_log(
+            kind, symbol, event_type, title, created_at,
+            traffic_key, cta_url, status_code, telegram_ok
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        kind, symbol, event_type, title, time.time(),
+        traffic_key, cta_url, status_code, 1 if telegram_ok else 0,
+    ))
     conn.commit()
     conn.close()
 
@@ -844,6 +883,67 @@ def make_fingerprint(text: str) -> str:
     normalized = re.sub(r"[^a-z0-9\u4e00-\u9fa5]+", " ", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return hashlib.md5(normalized.encode("utf-8")).hexdigest() if normalized else ""
+
+
+def slug_part(text: str, max_len: int = 32) -> str:
+    normalized = (text or "").lower()
+    normalized = re.sub(r"[^a-z0-9]+", "-", normalized)
+    normalized = re.sub(r"-+", "-", normalized).strip("-")
+    return normalized[:max_len].strip("-")
+
+
+def build_traffic_key(kind: str, symbol: str = "", event_type: str = "", title: str = "") -> str:
+    parts = [
+        slug_part(kind, 18) or "post",
+        slug_part(symbol.replace("USDT", ""), 12),
+        slug_part(event_type, 24),
+        current_date_key(),
+        make_fingerprint(title or f"{kind}:{symbol}:{event_type}")[:8],
+    ]
+    return "-".join([p for p in parts if p])
+
+
+def append_tracking_params(url: str, traffic_key: str) -> str:
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+        params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        params.setdefault("utm_source", TRAFFIC_UTM_SOURCE)
+        params.setdefault("utm_medium", TRAFFIC_UTM_MEDIUM)
+        params.setdefault("utm_campaign", TRAFFIC_CAMPAIGN)
+        params["utm_content"] = traffic_key
+        if TRAFFIC_REF_PARAM:
+            params[TRAFFIC_REF_PARAM] = traffic_key
+        return urlunparse(parsed._replace(query=urlencode(params)))
+    except Exception:
+        return url
+
+
+def build_cta_url(kind: str, symbol: str = "", event_type: str = "", title: str = "") -> str:
+    return append_tracking_params(
+        TRAFFIC_CTA_URL,
+        build_traffic_key(kind, symbol=symbol, event_type=event_type, title=title),
+    )
+
+
+def build_reply_markup(kind: str = "post", symbol: str = "", event_type: str = "", title: str = "") -> Optional[str]:
+    if not ENABLE_TRAFFIC_BUTTON or not TRAFFIC_CTA_URL:
+        return None
+
+    traffic_key = build_traffic_key(kind, symbol=symbol, event_type=event_type, title=title)
+    buttons = [{
+        "text": TRAFFIC_CTA_TEXT,
+        "url": append_tracking_params(TRAFFIC_CTA_URL, traffic_key),
+    }]
+
+    if TRAFFIC_SECONDARY_URL:
+        buttons.append({
+            "text": TRAFFIC_SECONDARY_TEXT,
+            "url": append_tracking_params(TRAFFIC_SECONDARY_URL, traffic_key),
+        })
+
+    return json.dumps({"inline_keyboard": [buttons]}, ensure_ascii=False)
 
 
 def request_json(url: str, params: Optional[dict] = None, timeout: int = REQUEST_TIMEOUT):
@@ -2272,12 +2372,13 @@ def process_hotword_column() -> bool:
         return False
 
     image = get_hotword_image_path()
-    resp = send_with_image(content, image)
+    title = row.get("title", "")[:80]
+    resp = send_with_image(content, image, kind="hotword", event_type="hotword", title=title)
 
     if resp.status_code == 200:
         now = time.time()
         set_meta("last_global_sent_at", str(now))
-        record_sent("hotword", "", "hotword", title=row.get("title", "")[:80])
+        record_sent("hotword", "", "hotword", title=title, status_code=resp.status_code, telegram_ok=True)
         mark_hotword_sent(row["id"])
         print(f"币圈热词监控已发送：{row.get('send_time')} {row.get('title')}")
         return True
@@ -2900,10 +3001,12 @@ def process_extra_columns() -> bool:
     if not os.path.isfile(image):
         image = extra_column_image_path(row.get("column_type", ""))
 
-    resp = send_with_image(row["content"], image)
+    title = row.get("title", "")[:80]
+    column_type = row.get("column_type", "extra")
+    resp = send_with_image(row["content"], image, kind="extra_column", event_type=column_type, title=title)
     if resp.status_code == 200:
         set_meta("last_extra_column_sent_at", str(time.time()))
-        record_sent("extra_column", "", row.get("column_type", "extra"), title=row.get("title", "")[:80])
+        record_sent("extra_column", "", column_type, title=title, status_code=resp.status_code, telegram_ok=True)
         mark_extra_column_sent(row["id"])
         print("扩展栏目已发送:", row.get("title"))
         return True
@@ -2951,23 +3054,40 @@ def safe_caption(text: str) -> str:
     return text[:1000].rstrip() + "\n……"
 
 
-def send_telegram_message(text: str):
+def send_telegram_message(text: str, kind: str = "post", symbol: str = "", event_type: str = "", title: str = ""):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    reply_markup = build_reply_markup(kind, symbol=symbol, event_type=event_type, title=title or text[:80])
+    if reply_markup:
+        data["reply_markup"] = reply_markup
+
     resp = requests.post(
         url,
-        data={"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True},
+        data=data,
         timeout=30,
     )
     print("sendMessage:", resp.status_code, resp.text[:300])
     return resp
 
 
-def send_telegram_photo(photo_path: str, caption: str):
+def send_telegram_photo(photo_path: str, caption: str, kind: str = "post", symbol: str = "", event_type: str = "", title: str = ""):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    data = {
+        "chat_id": CHAT_ID,
+        "caption": safe_caption(caption),
+    }
+    reply_markup = build_reply_markup(kind, symbol=symbol, event_type=event_type, title=title or caption[:80])
+    if reply_markup:
+        data["reply_markup"] = reply_markup
+
     with open(photo_path, "rb") as f:
         resp = requests.post(
             url,
-            data={"chat_id": CHAT_ID, "caption": safe_caption(caption)},
+            data=data,
             files={"photo": f},
             timeout=30,
         )
@@ -2975,13 +3095,13 @@ def send_telegram_photo(photo_path: str, caption: str):
     return resp
 
 
-def send_with_image(text: str, image: str = ""):
+def send_with_image(text: str, image: str = "", kind: str = "post", symbol: str = "", event_type: str = "", title: str = ""):
     if image and os.path.isfile(image):
-        resp = send_telegram_photo(image, text)
+        resp = send_telegram_photo(image, text, kind=kind, symbol=symbol, event_type=event_type, title=title)
         if resp.status_code == 200:
             return resp
         print("图片发送失败，改为纯文字")
-    return send_telegram_message(text)
+    return send_telegram_message(text, kind=kind, symbol=symbol, event_type=event_type, title=title)
 
 
 # =========================
@@ -3080,13 +3200,27 @@ def process_market_posts() -> int:
 
         message = build_market_message(analysis, event, news_context)
         image = get_symbol_image_path(symbol)
-        resp = send_with_image(message, image)
+        resp = send_with_image(
+            message,
+            image,
+            kind="market",
+            symbol=symbol,
+            event_type=event["event_type"],
+            title=message[:80],
+        )
 
         now = time.time()
         if resp.status_code == 200:
             print(f"{symbol} 已发送：{event['event_type']} / {analysis['signal']}")
             set_meta("last_global_sent_at", str(now))
-            record_sent("market", symbol, event["event_type"], title=message[:80])
+            record_sent(
+                "market",
+                symbol,
+                event["event_type"],
+                title=message[:80],
+                status_code=resp.status_code,
+                telegram_ok=True,
+            )
             upsert_state(
                 symbol,
                 analysis["display"],
@@ -3133,12 +3267,13 @@ def process_lm_column() -> bool:
     news = news_list[0]
     message = build_airdrop_message(news)
     image = get_lm_image_path()
-    resp = send_with_image(message, image)
+    event_type = "airdrop_rss" if news else "lm_generic"
+    resp = send_with_image(message, image, kind="lm", event_type=event_type, title=message[:80])
 
     if resp.status_code == 200:
         now = time.time()
         set_meta("last_lm_sent_at", str(now))
-        record_sent("lm", "", "airdrop_rss" if news else "lm_generic", title=message[:80])
+        record_sent("lm", "", event_type, title=message[:80], status_code=resp.status_code, telegram_ok=True)
         if news:
             mark_news_used(news["link"])
         print("撸毛/空投栏目已发送")
@@ -3193,6 +3328,7 @@ def main():
     print("扩展栏目类型:", ", ".join(enabled_extra_column_types()))
     print("扩展栏目每日:", EXTRA_COLUMN_POSTS_PER_DAY, "条")
     print("扩展栏目发送时间:", ", ".join(extra_column_send_times()))
+    print("流量按钮:", "开启" if ENABLE_TRAFFIC_BUTTON and TRAFFIC_CTA_URL else "关闭或未配置 TRAFFIC_CTA_URL")
 
     if not has_any_state():
         print("首次启动：将初始化币种状态，避免一启动就刷旧信号")
