@@ -8,6 +8,7 @@ import sqlite3
 import hashlib
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
 import feedparser
@@ -86,6 +87,25 @@ WIKI_IMAGE = os.getenv("WIKI_IMAGE", "wiki.png")
 ENABLE_DYNAMIC_TOP_COINS = os.getenv("ENABLE_DYNAMIC_TOP_COINS", "true").lower() == "true"
 SYMBOL_REFRESH_INTERVAL = int(os.getenv("SYMBOL_REFRESH_INTERVAL", "21600"))  # 6小时刷新一次
 TOP_COIN_COUNT = int(os.getenv("TOP_COIN_COUNT", "10"))
+ENABLE_TRENDING_COINS = os.getenv("ENABLE_TRENDING_COINS", "true").lower() == "true"
+TRENDING_COIN_COUNT = int(os.getenv("TRENDING_COIN_COUNT", "5"))
+TRENDING_MIN_QUOTE_VOLUME = float(os.getenv("TRENDING_MIN_QUOTE_VOLUME", "20000000"))
+TRENDING_MIN_24H_MOVE = float(os.getenv("TRENDING_MIN_24H_MOVE", "8"))
+MAX_MONITORED_SYMBOLS = int(os.getenv("MAX_MONITORED_SYMBOLS", str(TOP_COIN_COUNT + TRENDING_COIN_COUNT)))
+HOT_MOVER_1H_THRESHOLD = float(os.getenv("HOT_MOVER_1H_THRESHOLD", "2.5"))
+HOT_MOVER_24H_THRESHOLD = float(os.getenv("HOT_MOVER_24H_THRESHOLD", "8"))
+
+# 流量转化：设置 TRAFFIC_CTA_URL 后，Telegram 帖子会自动加按钮和追踪参数
+ENABLE_TRAFFIC_BUTTON = os.getenv("ENABLE_TRAFFIC_BUTTON", "true").lower() == "true"
+TRAFFIC_CTA_URL = os.getenv("TRAFFIC_CTA_URL", "").strip()
+TRAFFIC_CTA_TEXT = os.getenv("TRAFFIC_CTA_TEXT", "查看完整入口").strip() or "查看完整入口"
+TRAFFIC_SECONDARY_URL = os.getenv("TRAFFIC_SECONDARY_URL", "").strip()
+TRAFFIC_SECONDARY_TEXT = os.getenv("TRAFFIC_SECONDARY_TEXT", "加入频道").strip() or "加入频道"
+TRAFFIC_CAMPAIGN = os.getenv("TRAFFIC_CAMPAIGN", "btc_telegram").strip() or "btc_telegram"
+TRAFFIC_REF_PARAM = os.getenv("TRAFFIC_REF_PARAM", "ref").strip() or "ref"
+TRAFFIC_UTM_SOURCE = os.getenv("TRAFFIC_UTM_SOURCE", "telegram").strip() or "telegram"
+TRAFFIC_UTM_MEDIUM = os.getenv("TRAFFIC_UTM_MEDIUM", "channel").strip() or "channel"
+SEND_LONG_TEXT_AFTER_PHOTO = os.getenv("SEND_LONG_TEXT_AFTER_PHOTO", "true").lower() == "true"
 
 # 首次启动只初始化，不发旧信号
 FIRST_RUN_INIT_ONLY = os.getenv("FIRST_RUN_INIT_ONLY", "true").lower() == "true"
@@ -300,6 +320,7 @@ EVENT_TAGS = {
     "breakout": ["#突破监控", "#放量突破", "#压力位", "#短线转强", "#主流币异动", "#行情异动"],
     "breakdown": ["#跌破监控", "#支撑位", "#短线转弱", "#风险监控", "#行情回落", "#下跌监控"],
     "volume_spike": ["#放量异动", "#成交量放大", "#异动监控", "#资金异动", "#短线波动", "#行情异动"],
+    "hot_mover": ["#热门异动", "#热搜币", "#山寨异动", "#高波动", "#短线雷达", "#行情异动"],
     "daily_coverage": ["#每日监控", "#主流币监控", "#行情观察", "#短线结构", "#币圈监控"],
     "news_driven": ["#新闻驱动", "#市场消息", "#行情分析", "#加密新闻", "#币圈监控"],
     "hotword": ["#币圈热词", "#热词监控", "#热搜币", "#行情热词", "#币圈监控"],
@@ -367,6 +388,13 @@ HOTWORD_BLOCK_KEYWORDS = [
 # 数据库
 # =========================
 
+def ensure_column(cur, table: str, column: str, definition: str):
+    cur.execute(f"PRAGMA table_info({table})")
+    existing = {row[1] for row in cur.fetchall()}
+    if column not in existing:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def init_db():
     conn = db_connect()
     cur = conn.cursor()
@@ -401,6 +429,16 @@ def init_db():
             created_at REAL
         )
     """)
+
+    ensure_column(cur, "sent_log", "traffic_key", "TEXT")
+    ensure_column(cur, "sent_log", "cta_url", "TEXT")
+    ensure_column(cur, "sent_log", "status_code", "INTEGER")
+    ensure_column(cur, "sent_log", "telegram_ok", "INTEGER DEFAULT 0")
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sent_log_created_at ON sent_log(created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sent_log_kind_created_at ON sent_log(kind, created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sent_log_symbol_created_at ON sent_log(symbol, created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sent_log_traffic_key ON sent_log(traffic_key)")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS news_items (
@@ -546,13 +584,23 @@ def has_any_state() -> bool:
     return count > 0
 
 
-def record_sent(kind: str, symbol: str = "", event_type: str = "", title: str = ""):
+def record_sent(kind: str, symbol: str = "", event_type: str = "", title: str = "",
+                status_code: Optional[int] = None, telegram_ok: bool = True):
+    traffic_key = build_traffic_key(kind, symbol=symbol, event_type=event_type, title=title)
+    cta_url = append_tracking_params(TRAFFIC_CTA_URL, traffic_key) if TRAFFIC_CTA_URL else ""
+
     conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO sent_log(kind, symbol, event_type, title, created_at)
-        VALUES (?, ?, ?, ?, ?)
-    """, (kind, symbol, event_type, title, time.time()))
+        INSERT INTO sent_log(
+            kind, symbol, event_type, title, created_at,
+            traffic_key, cta_url, status_code, telegram_ok
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        kind, symbol, event_type, title, time.time(),
+        traffic_key, cta_url, status_code, 1 if telegram_ok else 0,
+    ))
     conn.commit()
     conn.close()
 
@@ -846,6 +894,60 @@ def make_fingerprint(text: str) -> str:
     return hashlib.md5(normalized.encode("utf-8")).hexdigest() if normalized else ""
 
 
+def slug_part(text: str, max_len: int = 32) -> str:
+    normalized = (text or "").lower()
+    normalized = re.sub(r"[^a-z0-9]+", "-", normalized)
+    normalized = re.sub(r"-+", "-", normalized).strip("-")
+    return normalized[:max_len].strip("-")
+
+
+def build_traffic_key(kind: str, symbol: str = "", event_type: str = "", title: str = "") -> str:
+    parts = [
+        slug_part(kind, 18) or "post",
+        slug_part(symbol.replace("USDT", ""), 12),
+        slug_part(event_type, 24),
+        current_date_key(),
+        make_fingerprint(title or f"{kind}:{symbol}:{event_type}")[:8],
+    ]
+    return "-".join([p for p in parts if p])
+
+
+def append_tracking_params(url: str, traffic_key: str) -> str:
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+        params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        params.setdefault("utm_source", TRAFFIC_UTM_SOURCE)
+        params.setdefault("utm_medium", TRAFFIC_UTM_MEDIUM)
+        params.setdefault("utm_campaign", TRAFFIC_CAMPAIGN)
+        params["utm_content"] = traffic_key
+        if TRAFFIC_REF_PARAM:
+            params[TRAFFIC_REF_PARAM] = traffic_key
+        return urlunparse(parsed._replace(query=urlencode(params)))
+    except Exception:
+        return url
+
+
+def build_reply_markup(kind: str = "post", symbol: str = "", event_type: str = "", title: str = "") -> Optional[str]:
+    if not ENABLE_TRAFFIC_BUTTON or not TRAFFIC_CTA_URL:
+        return None
+
+    traffic_key = build_traffic_key(kind, symbol=symbol, event_type=event_type, title=title)
+    buttons = [{
+        "text": TRAFFIC_CTA_TEXT,
+        "url": append_tracking_params(TRAFFIC_CTA_URL, traffic_key),
+    }]
+
+    if TRAFFIC_SECONDARY_URL:
+        buttons.append({
+            "text": TRAFFIC_SECONDARY_TEXT,
+            "url": append_tracking_params(TRAFFIC_SECONDARY_URL, traffic_key),
+        })
+
+    return json.dumps({"inline_keyboard": [buttons]}, ensure_ascii=False)
+
+
 def request_json(url: str, params: Optional[dict] = None, timeout: int = REQUEST_TIMEOUT):
     resp = requests.get(url, params=params or {}, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
     resp.raise_for_status()
@@ -895,9 +997,81 @@ def binance_symbol_exists(symbol: str) -> bool:
         return False
 
 
+def binance_base_from_pair(symbol: str) -> str:
+    return symbol[:-4] if symbol.endswith("USDT") else symbol
+
+
+def is_monitorable_base(base: str) -> bool:
+    base = (base or "").upper().strip()
+    if not base:
+        return False
+    if base in STABLE_SYMBOLS or base in EXCLUDED_TOP_SYMBOLS:
+        return False
+    if any(base.endswith(x) for x in ["UP", "DOWN", "BULL", "BEAR"]):
+        return False
+    if any(x in base for x in ["USD", "USDT", "USDC"]):
+        return False
+    return True
+
+
+def merge_symbol_maps(*maps: Dict[str, str], limit: int = MAX_MONITORED_SYMBOLS) -> Dict[str, str]:
+    merged = {}
+    for item in maps:
+        for symbol, display in item.items():
+            if symbol not in merged:
+                merged[symbol] = display
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
+def fetch_binance_trending_symbols(limit: int = TRENDING_COIN_COUNT) -> Dict[str, str]:
+    if not ENABLE_TRENDING_COINS or limit <= 0:
+        return {}
+
+    try:
+        tickers = request_json(f"{BINANCE_BASE_URL}/api/v3/ticker/24hr", timeout=15)
+        scored = []
+
+        for item in tickers:
+            symbol = str(item.get("symbol", "")).upper()
+            if not symbol.endswith("USDT"):
+                continue
+
+            base = binance_base_from_pair(symbol)
+            if not is_monitorable_base(base):
+                continue
+
+            try:
+                pct = float(item.get("priceChangePercent") or 0)
+                quote_volume = float(item.get("quoteVolume") or 0)
+            except Exception:
+                continue
+
+            if quote_volume < TRENDING_MIN_QUOTE_VOLUME:
+                continue
+            if abs(pct) < TRENDING_MIN_24H_MOVE:
+                continue
+
+            # 兼顾热度和流动性，避免只追极端小币。
+            liquidity_score = math.log10(max(quote_volume, 1))
+            score = abs(pct) * 1.8 + liquidity_score
+            scored.append((score, symbol, base, pct, quote_volume))
+
+        scored.sort(reverse=True)
+        result = {symbol: display for _, symbol, display, _, _ in scored[:limit]}
+        if result:
+            print("Binance 热门异动币种:", result)
+        return result
+
+    except Exception as e:
+        print("获取 Binance 热门异动币失败:", e)
+        return {}
+
+
 def fetch_top_market_symbols() -> Dict[str, str]:
     if not ENABLE_DYNAMIC_TOP_COINS:
-        return FALLBACK_SYMBOLS.copy()
+        return merge_symbol_maps(FALLBACK_SYMBOLS.copy(), fetch_binance_trending_symbols())
 
     try:
         data = request_json(
@@ -938,16 +1112,21 @@ def fetch_top_market_symbols() -> Dict[str, str]:
             if len(result) >= TOP_COIN_COUNT:
                 break
 
+        trending = fetch_binance_trending_symbols()
+
         if len(result) >= 5:
+            merged = merge_symbol_maps(result, trending)
             print("动态市值币种:", result)
-            return result
+            if trending:
+                print("合并热门异动后监控:", merged)
+            return merged
 
         print("动态市值币种不足，使用备用列表")
-        return FALLBACK_SYMBOLS.copy()
+        return merge_symbol_maps(FALLBACK_SYMBOLS.copy(), trending)
 
     except Exception as e:
         print("获取市值前十失败，使用备用列表:", e)
-        return FALLBACK_SYMBOLS.copy()
+        return merge_symbol_maps(FALLBACK_SYMBOLS.copy(), fetch_binance_trending_symbols())
 
 
 def refresh_symbols_if_needed(force: bool = False):
@@ -1195,6 +1374,17 @@ def detect_event(analysis: dict, state: dict):
             "priority": 80,
         }
 
+    if abs(analysis.get("change_1h", 0)) >= HOT_MOVER_1H_THRESHOLD or abs(analysis.get("pct_24h", 0)) >= HOT_MOVER_24H_THRESHOLD:
+        direction = "up" if analysis.get("change_1h", 0) >= 0 else "down"
+        move_bucket = round(max(abs(analysis.get("change_1h", 0)), abs(analysis.get("pct_24h", 0))), 1)
+        return {
+            "event_type": "hot_mover",
+            "event_key": f"{symbol}:hot_mover:{direction}:{move_bucket}",
+            "should_send": True,
+            "event_note": "热门异动币进入监控池，短线或24小时波动达到阈值",
+            "priority": 75 + min(abs(analysis.get("change_1h", 0)) * 2, 10),
+        }
+
     return {
         "event_type": "none",
         "event_key": f"{symbol}:none:{signal}",
@@ -1379,6 +1569,7 @@ EVENT_CN = {
     "breakout": "突破压力",
     "breakdown": "跌破支撑",
     "volume_spike": "放量异动",
+    "hot_mover": "热门异动",
     "daily_coverage": "每日监控",
     "news_driven": "新闻驱动",
     "none": "常规观察",
@@ -1390,6 +1581,7 @@ TITLE_PREFIX_POOL = {
     "breakout": ["突破监控", "行情异动", "主流币监控", "压力位监控", "短线突破"],
     "breakdown": ["跌破监控", "风险监控", "行情监控", "支撑位监控", "短线回落"],
     "volume_spike": ["放量异动", "异动监控", "成交量监控", "资金异动", "行情监控"],
+    "hot_mover": ["热门异动", "热搜币雷达", "山寨异动", "高波动监控", "短线雷达"],
     "daily_coverage": ["每日监控", "币圈监控", "行情监控", "主流币监控", "短线观察"],
     "news_driven": ["新闻驱动", "行情分析", "市场消息", "币圈监控", "行情监控"],
 }
@@ -1466,6 +1658,8 @@ def build_keyword_text(analysis: dict, event: dict, news_context: List[dict]) ->
         pool.extend(["跌破监控", "支撑位", "短线转弱"])
     elif event_type == "volume_spike":
         pool.extend(["放量异动", "成交量放大", "资金异动"])
+    elif event_type == "hot_mover":
+        pool.extend(["热门异动", "热搜币", "高波动", "山寨异动", "短线雷达"])
     elif event_type == "signal_change":
         pool.extend(["信号监控", "趋势切换", "短线信号"])
 
@@ -2272,12 +2466,13 @@ def process_hotword_column() -> bool:
         return False
 
     image = get_hotword_image_path()
-    resp = send_with_image(content, image)
+    title = row.get("title", "")[:80]
+    resp = send_with_image(content, image, kind="hotword", event_type="hotword", title=title)
 
     if resp.status_code == 200:
         now = time.time()
         set_meta("last_global_sent_at", str(now))
-        record_sent("hotword", "", "hotword", title=row.get("title", "")[:80])
+        record_sent("hotword", "", "hotword", title=title, status_code=resp.status_code, telegram_ok=True)
         mark_hotword_sent(row["id"])
         print(f"币圈热词监控已发送：{row.get('send_time')} {row.get('title')}")
         return True
@@ -2900,10 +3095,12 @@ def process_extra_columns() -> bool:
     if not os.path.isfile(image):
         image = extra_column_image_path(row.get("column_type", ""))
 
-    resp = send_with_image(row["content"], image)
+    title = row.get("title", "")[:80]
+    column_type = row.get("column_type", "extra")
+    resp = send_with_image(row["content"], image, kind="extra_column", event_type=column_type, title=title)
     if resp.status_code == 200:
         set_meta("last_extra_column_sent_at", str(time.time()))
-        record_sent("extra_column", "", row.get("column_type", "extra"), title=row.get("title", "")[:80])
+        record_sent("extra_column", "", column_type, title=title, status_code=resp.status_code, telegram_ok=True)
         mark_extra_column_sent(row["id"])
         print("扩展栏目已发送:", row.get("title"))
         return True
@@ -2951,23 +3148,61 @@ def safe_caption(text: str) -> str:
     return text[:1000].rstrip() + "\n……"
 
 
-def send_telegram_message(text: str):
+def extract_tag_line(text: str) -> str:
+    for line in reversed((text or "").splitlines()):
+        line = line.strip()
+        if "#" in line:
+            return line
+    return ""
+
+
+def compact_photo_caption(text: str, followup: bool = False) -> str:
+    text = (text or "").strip()
+    if len(text) <= 1024:
+        return text
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    title = lines[0] if lines else ""
+    tag_line = extract_tag_line(text)
+    suffix = "\n\n完整内容见下一条" if followup else "\n\n更多细节见正文"
+    reserved = len(title) + len(tag_line) + len(suffix) + 8
+    body_budget = max(220, 980 - reserved)
+
+    body = "\n".join(lines[1:]) if len(lines) > 1 else text
+    body = body.replace(tag_line, "").strip() if tag_line else body
+    body = body[:body_budget].rstrip()
+
+    parts = [x for x in [title, body + "……", tag_line, suffix.strip()] if x]
+    return "\n\n".join(parts)[:1024].rstrip()
+
+
+def send_telegram_message(text: str, kind: str = "post", symbol: str = "", event_type: str = "", title: str = ""):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}
+    reply_markup = build_reply_markup(kind, symbol=symbol, event_type=event_type, title=title or text[:80])
+    if reply_markup:
+        data["reply_markup"] = reply_markup
+
     resp = requests.post(
         url,
-        data={"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True},
+        data=data,
         timeout=30,
     )
     print("sendMessage:", resp.status_code, resp.text[:300])
     return resp
 
 
-def send_telegram_photo(photo_path: str, caption: str):
+def send_telegram_photo(photo_path: str, caption: str, kind: str = "post", symbol: str = "", event_type: str = "", title: str = ""):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    data = {"chat_id": CHAT_ID, "caption": safe_caption(caption)}
+    reply_markup = build_reply_markup(kind, symbol=symbol, event_type=event_type, title=title or caption[:80])
+    if reply_markup:
+        data["reply_markup"] = reply_markup
+
     with open(photo_path, "rb") as f:
         resp = requests.post(
             url,
-            data={"chat_id": CHAT_ID, "caption": safe_caption(caption)},
+            data=data,
             files={"photo": f},
             timeout=30,
         )
@@ -2975,13 +3210,24 @@ def send_telegram_photo(photo_path: str, caption: str):
     return resp
 
 
-def send_with_image(text: str, image: str = ""):
+def send_with_image(text: str, image: str = "", kind: str = "post", symbol: str = "", event_type: str = "", title: str = ""):
     if image and os.path.isfile(image):
-        resp = send_telegram_photo(image, text)
+        needs_followup = SEND_LONG_TEXT_AFTER_PHOTO and len((text or "").strip()) > 1024
+        caption = compact_photo_caption(text, followup=needs_followup)
+        resp = send_telegram_photo(image, caption, kind=kind, symbol=symbol, event_type=event_type, title=title)
         if resp.status_code == 200:
+            if needs_followup:
+                follow_resp = send_telegram_message(
+                    text,
+                    kind=kind,
+                    symbol=symbol,
+                    event_type=event_type,
+                    title=title,
+                )
+                print("longTextFollowup:", follow_resp.status_code, follow_resp.text[:300])
             return resp
         print("图片发送失败，改为纯文字")
-    return send_telegram_message(text)
+    return send_telegram_message(text, kind=kind, symbol=symbol, event_type=event_type, title=title)
 
 
 # =========================
@@ -3080,13 +3326,27 @@ def process_market_posts() -> int:
 
         message = build_market_message(analysis, event, news_context)
         image = get_symbol_image_path(symbol)
-        resp = send_with_image(message, image)
+        resp = send_with_image(
+            message,
+            image,
+            kind="market",
+            symbol=symbol,
+            event_type=event["event_type"],
+            title=message[:80],
+        )
 
         now = time.time()
         if resp.status_code == 200:
             print(f"{symbol} 已发送：{event['event_type']} / {analysis['signal']}")
             set_meta("last_global_sent_at", str(now))
-            record_sent("market", symbol, event["event_type"], title=message[:80])
+            record_sent(
+                "market",
+                symbol,
+                event["event_type"],
+                title=message[:80],
+                status_code=resp.status_code,
+                telegram_ok=True,
+            )
             upsert_state(
                 symbol,
                 analysis["display"],
@@ -3133,12 +3393,13 @@ def process_lm_column() -> bool:
     news = news_list[0]
     message = build_airdrop_message(news)
     image = get_lm_image_path()
-    resp = send_with_image(message, image)
+    event_type = "airdrop_rss" if news else "lm_generic"
+    resp = send_with_image(message, image, kind="lm", event_type=event_type, title=message[:80])
 
     if resp.status_code == 200:
         now = time.time()
         set_meta("last_lm_sent_at", str(now))
-        record_sent("lm", "", "airdrop_rss" if news else "lm_generic", title=message[:80])
+        record_sent("lm", "", event_type, title=message[:80], status_code=resp.status_code, telegram_ok=True)
         if news:
             mark_news_used(news["link"])
         print("撸毛/空投栏目已发送")
@@ -3193,6 +3454,10 @@ def main():
     print("扩展栏目类型:", ", ".join(enabled_extra_column_types()))
     print("扩展栏目每日:", EXTRA_COLUMN_POSTS_PER_DAY, "条")
     print("扩展栏目发送时间:", ", ".join(extra_column_send_times()))
+    print("热门异动币池:", "开启" if ENABLE_TRENDING_COINS else "关闭", f"最多{TRENDING_COIN_COUNT}个")
+    print("热门异动阈值:", f"1h {HOT_MOVER_1H_THRESHOLD}% / 24h {HOT_MOVER_24H_THRESHOLD}%")
+    print("流量按钮:", "开启" if ENABLE_TRAFFIC_BUTTON and TRAFFIC_CTA_URL else "关闭或未配置 TRAFFIC_CTA_URL")
+    print("长图文保护:", "开启" if SEND_LONG_TEXT_AFTER_PHOTO else "关闭")
 
     if not has_any_state():
         print("首次启动：将初始化币种状态，避免一启动就刷旧信号")
